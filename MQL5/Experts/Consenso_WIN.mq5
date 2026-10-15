@@ -40,9 +40,13 @@
 //|   - ORDER_FILLING_RETURN na B3 e validade DAY/GTC conforme ativo  |
 //|   - tentativa nao concluida (falha de envio) repete na barra      |
 //|     seguinte enquanto os votos valerem                            |
+//|                                                                   |
+//|  v1.02 - painel no grafico: cada robo COMPRADO / VENDIDO /        |
+//|          SEM SINAL, placar de votos e status. Resumo no log a     |
+//|          cada barra em que os votos mudam.                        |
 //+------------------------------------------------------------------+
 #property copyright "Maikon"
-#property version   "1.01"
+#property version   "1.02"
 
 #include <Trade\Trade.mqh>
 
@@ -84,6 +88,15 @@ input group "Operacional"
 input ulong      InpMagic         = 777001;
 input int        InpSlippage      = 20;
 input bool       InpLog           = true;
+
+input group "Painel"
+input bool       InpMostrarPainel = true;              // Mostrar painel no grafico
+input int        InpPainelX       = 14;                // Posicao X (pixels)
+input int        InpPainelY       = 26;                // Posicao Y (pixels)
+input color      InpCorTexto      = clrSilver;         // Texto
+input color      InpCorCompra     = clrMediumSeaGreen; // Comprado
+input color      InpCorVenda      = clrIndianRed;      // Vendido
+input color      InpCorFundo      = C'22,22,26';       // Fundo
 
 //==================================================================
 //  FILTROS COMPARTILHADOS
@@ -215,6 +228,11 @@ ulong    ultimaAvaliacaoMs = 0;
 datetime chopUltBarra = 0, chopAte = 0;
 bool     chopAtivo = false;
 
+//--- painel
+#define  PFX "CONS_"
+bool     painelAtivo = false;
+datetime painelUltSeg = 0;
+
 //+------------------------------------------------------------------+
 //| INIT                                                             |
 //+------------------------------------------------------------------+
@@ -310,6 +328,11 @@ int OnInit()
 
    for(int v = 0; v < NVOTOS; v++) { votos[v].dir = 0; votos[v].barra = 0; }
 
+   //--- painel: no testador sem modo visual nao ha grafico para desenhar
+   painelAtivo = InpMostrarPainel &&
+                 !(MQLInfoInteger(MQL_TESTER) && !MQLInfoInteger(MQL_VISUAL_MODE));
+   if(painelAtivo) AtualizarPainel(true);
+
    PrintFormat("Consenso: %d de %d votos | limite %s (dist %d) | validade %d/%d barras | stop %d | alvo %d",
                InpVotosMin, ativos,
                InpModoPreco == PRECO_FECHAMENTO ? "no FECHAMENTO" : "na MAX/MIN",
@@ -321,6 +344,8 @@ void OnDeinit(const int reason)
 {
    if(hMA  != INVALID_HANDLE) IndicatorRelease(hMA);
    if(hATR != INVALID_HANDLE) IndicatorRelease(hATR);
+   ObjectsDeleteAll(0, PFX);
+   ChartRedraw(0);
 }
 
 //+------------------------------------------------------------------+
@@ -1119,6 +1144,166 @@ void CancelarVencida()
 void MarcarConsenso(int dir, datetime chave) { consDir = dir; consChave = chave; }
 
 //+==================================================================+
+//| ESTADO DE CADA ROBO - painel e log                               |
+//+==================================================================+
+bool VotoAtivo(int v)
+{
+   switch(v)
+   {
+      case 0: return InpUsarDelta;
+      case 1: return InpUsarFita;
+      case 2: return InpUsarVP;
+      case 3: return InpUsarAgressao;
+   }
+   return false;
+}
+
+string EstadoVoto(int v)
+{
+   if(!VotoAtivo(v))  return "DESLIGADO";
+   if(!VotoValido(v)) return "SEM SINAL";
+   return (votos[v].dir > 0) ? "COMPRADO" : "VENDIDO";
+}
+
+//--- uma linha no log sempre que o quadro de votos muda
+void LogResumo(int compras, int vendas)
+{
+   if(!InpLog) return;
+   static string anterior = "";
+   string s = "";
+   for(int v = 0; v < NVOTOS; v++)
+   {
+      if(!VotoAtivo(v)) continue;
+      if(s != "") s += " | ";
+      s += NOMES[v] + " " + EstadoVoto(v);
+   }
+   s += StringFormat("  =>  compra %d x %d venda", compras, vendas);
+   if(s == anterior) return;
+   anterior = s;
+   Print("VOTOS: ", s);
+}
+
+void Rotulo(string id, int x, int y, string txt, color cor, int tam = 9)
+{
+   string nome = PFX + id;
+   if(ObjectFind(0, nome) < 0)
+   {
+      ObjectCreate(0, nome, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, nome, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, nome, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
+      ObjectSetInteger(0, nome, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, nome, OBJPROP_HIDDEN, true);
+      ObjectSetString(0, nome, OBJPROP_FONT, "Consolas");
+   }
+   ObjectSetInteger(0, nome, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, nome, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, nome, OBJPROP_FONTSIZE, tam);
+   ObjectSetInteger(0, nome, OBJPROP_COLOR, cor);
+   ObjectSetString(0, nome, OBJPROP_TEXT, txt);
+}
+
+void Fundo(int x, int y, int larg, int alt)
+{
+   string nome = PFX + "fundo";
+   if(ObjectFind(0, nome) < 0)
+   {
+      ObjectCreate(0, nome, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, nome, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, nome, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(0, nome, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, nome, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, nome, OBJPROP_BACK, false);
+   }
+   ObjectSetInteger(0, nome, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, nome, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, nome, OBJPROP_XSIZE, larg);
+   ObjectSetInteger(0, nome, OBJPROP_YSIZE, alt);
+   ObjectSetInteger(0, nome, OBJPROP_BGCOLOR, InpCorFundo);
+   ObjectSetInteger(0, nome, OBJPROP_COLOR, InpCorTexto);
+}
+
+//+------------------------------------------------------------------+
+//|  CONSENSO WIN                                                    |
+//|  Delta      COMPRADO   (vale +2)                                 |
+//|  Fita       VENDIDO    (vale +3)                                 |
+//|  VP         SEM SINAL                                            |
+//|  Agressao   COMPRADO   (ultima barra)                            |
+//|  Compra 2 x 1 Venda  (precisa 3)                                 |
+//|  AGUARDANDO CONSENSO                                             |
+//+------------------------------------------------------------------+
+void AtualizarPainel(bool forcar = false)
+{
+   if(!painelAtivo) return;
+
+   //--- no maximo 1x por segundo, salvo quando algo acabou de mudar
+   datetime agora = TimeCurrent();
+   if(!forcar && agora == painelUltSeg) return;
+   painelUltSeg = agora;
+
+   int x = InpPainelX, y = InpPainelY, lh = 17;
+   int alt = 34 + NVOTOS * lh + 3 * lh + 12;
+   Fundo(x, y, 300, alt);
+   Rotulo("tit", x + 10, y + 8, "CONSENSO WIN", InpCorTexto, 10);
+
+   int compras = 0, vendas = 0;
+   for(int v = 0; v < NVOTOS; v++)
+   {
+      int    yy  = y + 34 + v * lh;
+      string est = EstadoVoto(v);
+      string ext = "";
+      color  cor = InpCorTexto;
+
+      if(!VotoAtivo(v)) cor = clrDimGray;
+      else if(VotoValido(v))
+      {
+         bool c = (votos[v].dir > 0);
+         if(c) compras++; else vendas++;
+         cor = c ? InpCorCompra : InpCorVenda;
+         int resta = InpVotoValidade - iBarShift(_Symbol, PERIOD_M1, votos[v].barra);
+         ext = (resta > 0) ? StringFormat("(vale +%d)", resta) : "(ultima barra)";
+      }
+      Rotulo("n" + IntegerToString(v), x + 10,  yy, NOMES[v], InpCorTexto);
+      Rotulo("e" + IntegerToString(v), x + 95,  yy, est, cor);
+      Rotulo("x" + IntegerToString(v), x + 185, yy, ext, InpCorTexto, 8);
+   }
+
+   int   yb = y + 34 + NVOTOS * lh + 6;
+   color cp = (compras >= InpVotosMin) ? InpCorCompra :
+              (vendas  >= InpVotosMin) ? InpCorVenda  : InpCorTexto;
+   Rotulo("placar", x + 10, yb,
+          StringFormat("Compra %d x %d Venda   (precisa %d)", compras, vendas, InpVotosMin), cp);
+
+   //--- status da operacao
+   ulong  t;
+   string st;
+   color  cs  = InpCorTexto;
+   int    pos = PosicaoDir(t);
+   int    ord = (pos == 0) ? OrdemDir(t) : 0;
+   if(pos != 0)
+   {
+      st = (pos > 0) ? "POSICAO COMPRADA" : "POSICAO VENDIDA";
+      cs = (pos > 0) ? InpCorCompra : InpCorVenda;
+   }
+   else if(ord != 0)
+   {
+      int b = (ordemBarra > 0) ? Bars(_Symbol, PERIOD_M1, ordemBarra, TimeCurrent()) - 1 : 0;
+      st = StringFormat("LIMITE DE %s  (barra %d de %d)",
+                        ord > 0 ? "COMPRA" : "VENDA", b + 1, ordemValid);
+      cs = (ord > 0) ? InpCorCompra : InpCorVenda;
+   }
+   else if(InpZerarFimDia && MinutosAgora() >= Minutos(InpZerar)) st = "ZERADO (FIM DO DIA)";
+   else if(!HorarioEntrada())                                      st = "FORA DO HORARIO";
+   else                                                            st = "AGUARDANDO CONSENSO";
+   Rotulo("status", x + 10, yb + lh, st, cs);
+
+   Rotulo("caut", x + 10, yb + 2 * lh,
+          chopAtivo ? "Modo cauteloso LIGADO" : "Modo cauteloso desligado",
+          chopAtivo ? clrGoldenrod : clrDimGray, 8);
+
+   ChartRedraw(0);
+}
+
+//+==================================================================+
 //| CONSENSO (a cada barra M1 nova)                                  |
 //+==================================================================+
 void NovaBarra()
@@ -1139,6 +1324,7 @@ void NovaBarra()
       if(!VotoValido(v)) continue;
       if(votos[v].dir > 0) compras++; else vendas++;
    }
+   LogResumo(compras, vendas);
 
    int dir = 0, n = 0;
    bool cBuy = (compras >= InpVotosMin), cSell = (vendas >= InpVotosMin);
@@ -1188,6 +1374,7 @@ void OnTick()
    {
       ulong t, o;
       if(PosicaoDir(t) != 0 || OrdemDir(o) != 0) Zerar();
+      AtualizarPainel();
       return;
    }
 
@@ -1208,6 +1395,9 @@ void OnTick()
    {
       lastBarTime = b0;
       NovaBarra();
+      AtualizarPainel(true);
    }
+   else
+      AtualizarPainel();
 }
 //+------------------------------------------------------------------+
