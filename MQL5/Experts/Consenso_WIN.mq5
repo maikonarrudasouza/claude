@@ -15,7 +15,8 @@
 //|  REGRAS                                                           |
 //|   - 3 ou 4 votos do mesmo lado -> sinal (mesmo com 1 contra).     |
 //|   - Entrada por ordem LIMITE:                                     |
-//|       modo FECHAMENTO: no fechamento da barra do sinal            |
+//|       modo FECHAMENTO: compra = fechamento - distancia            |
+//|                        venda  = fechamento + distancia            |
 //|       modo EXTREMO   : compra = minima - distancia                |
 //|                        venda  = maxima + distancia                |
 //|   - Validade da limite: 4 barras (4 votos) / 3 barras (3 votos).  |
@@ -48,9 +49,12 @@
 //|  v1.03 - padroes para mais entradas: voto vale 5 barras, limite  |
 //|          no fechamento (distancia 0), Agressao com fator 2.0,     |
 //|          filtro de tendencia do Delta e da Fita desligados.       |
+//|                                                                   |
+//|  v1.04 - limite a 200 pontos. A distancia passa a valer tambem    |
+//|          no modo fechamento (compra fech - dist / venda fech +).  |
 //+------------------------------------------------------------------+
 #property copyright "Maikon"
-#property version   "1.03"
+#property version   "1.04"
 
 #include <Trade\Trade.mqh>
 
@@ -59,7 +63,7 @@
 //==================================================================
 enum EModoPreco
 {
-   PRECO_FECHAMENTO = 0,   // Fechamento da barra do sinal
+   PRECO_FECHAMENTO = 0,   // Compra: fechamento - dist | Venda: fechamento + dist
    PRECO_EXTREMO    = 1    // Compra: minima - dist | Venda: maxima + dist
 };
 
@@ -73,7 +77,7 @@ input bool       InpUsarAgressao  = true;   // Voto 4: Agressao
 
 input group "Ordem limite"
 input EModoPreco InpModoPreco     = PRECO_FECHAMENTO; // Preco da ordem limite
-input int        InpDistancia     = 0;      // Distancia da maxima/minima (pontos)
+input int        InpDistancia     = 200;    // Distancia da limite (pontos) - vale nos dois modos
 input int        InpValidade4     = 4;      // Validade com 4 votos (barras)
 input int        InpValidade3     = 3;      // Validade com 3 votos (barras)
 input double     InpLots          = 1.0;    // Contratos
@@ -1062,8 +1066,11 @@ bool EnviarLimite(int dir, int nVotos)
    if(c1 <= 0.0) return false;
 
    double preco;
-   if(InpModoPreco == PRECO_FECHAMENTO) preco = c1;
-   else preco = (dir > 0) ? l1 - InpDistancia * _Point : h1 + InpDistancia * _Point;
+   //--- compra sempre ABAIXO da referencia, venda sempre ACIMA
+   if(InpModoPreco == PRECO_FECHAMENTO)
+      preco = (dir > 0) ? c1 - InpDistancia * _Point : c1 + InpDistancia * _Point;
+   else
+      preco = (dir > 0) ? l1 - InpDistancia * _Point : h1 + InpDistancia * _Point;
    preco = NormalizePrice(preco);
 
    double stop = NormalizePrice(preco - dir * InpStopPoints * _Point);
