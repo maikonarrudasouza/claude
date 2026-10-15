@@ -9,7 +9,8 @@
 //|   Voto 4 - Agressao      (agressao no Times & Trades)             |
 //|                                                                   |
 //|  Cada robo vota +1 (compra), -1 (venda) ou nao vota. O voto vale  |
-//|  por InpVotoValidade barras M1 depois de emitido.                 |
+//|  por InpVotoValidade barras M1 depois de emitido, e nunca passa   |
+//|  de um dia para o outro.                                          |
 //|                                                                   |
 //|  REGRAS                                                           |
 //|   - 3 ou 4 votos do mesmo lado -> sinal (mesmo com 1 contra).     |
@@ -24,11 +25,24 @@
 //|     pendente do outro lado: cancela e envia a nova.               |
 //|                                                                   |
 //|  Conta NETTING (B3, XP/Clear): uma posicao por vez, um magic so.  |
+//|  Nao rode os 4 robos antigos no mesmo ativo junto com este.       |
 //|  No testador use "cada tick com base em ticks reais".             |
+//|                                                                   |
+//|  v1.01 - revisao:                                                 |
+//|   - consenso controlado por "chave" (voto mais novo): nao perde   |
+//|     o voto da Fita na virada da barra e nao repete consenso velho |
+//|   - reversao checada antes da ordem pendente                      |
+//|   - zera na reversao mesmo fora do horario, mas so abre dentro    |
+//|   - empate (ex.: 2x2 com InpVotosMin=2) nao opera                 |
+//|   - votos de ontem nao valem hoje                                 |
+//|   - pivo do Delta so e marcado quando o voto sai de fato          |
+//|   - modo cauteloso da Fita restaurado                             |
+//|   - ORDER_FILLING_RETURN na B3 e validade DAY/GTC conforme ativo  |
+//|   - tentativa nao concluida (falha de envio) repete na barra      |
+//|     seguinte enquanto os votos valerem                            |
 //+------------------------------------------------------------------+
 #property copyright "Maikon"
-#property version   "1.00"
-#property strict
+#property version   "1.01"
 
 #include <Trade\Trade.mqh>
 
@@ -72,7 +86,22 @@ input int        InpSlippage      = 20;
 input bool       InpLog           = true;
 
 //==================================================================
-//  VOTO 1 - DELTA_FLUXO (parametros do robo original)
+//  FILTROS COMPARTILHADOS
+//==================================================================
+input group "Tendencia (Delta e Fita)"
+input ENUM_TIMEFRAMES T_TF       = PERIOD_M15;  // Timeframe da media
+input int             T_Periodo  = 50;          // Periodo da media
+input ENUM_MA_METHOD  T_Metodo   = MODE_EMA;    // Metodo da media
+input int             T_DistMin  = 50;          // Zona neutra (pontos)
+
+input group "Modo cauteloso (VP e Fita)"
+input int    C_JanelaMin = 30;    // Janela de leitura (minutos)
+input int    C_Pts       = 200;   // Recuo minimo para contar uma reversao (pontos)
+input int    C_Reversoes = 2;     // Reversoes que ligam o modo cauteloso
+input int    C_HoldMin   = 20;    // Fica cauteloso por no minimo (minutos)
+
+//==================================================================
+//  VOTO 1 - DELTA_FLUXO
 //==================================================================
 input group "Voto 1 - Delta_Fluxo"
 input bool   D_UsarDivergencia = true;   // Divergencia de delta
@@ -85,10 +114,6 @@ input int    D_MaxPivotAge     = 5;      // Idade maxima do pivo recente
 input double D_MinPriceDiff    = 30;     // Diferenca minima de preco (pontos)
 input long   D_MinDeltaDiff    = 200;    // Diferenca minima de delta
 input bool   D_FiltroTend      = true;   // So a favor da media
-input ENUM_TIMEFRAMES D_TFTend = PERIOD_M15;
-input int    D_MAPeriodo       = 50;
-input ENUM_MA_METHOD D_MAMetodo = MODE_EMA;
-input int    D_MADistMin       = 50;
 
 //==================================================================
 //  VOTO 2 - FITA
@@ -112,6 +137,8 @@ input int    F_AcumJanelaSeg   = 600;
 input long   F_AcumMinimo      = 500;
 input bool   F_FiltroTend      = true;
 input int    F_SinaisIgnoraTend= 3;      // N sinais internos ignoram a tendencia (0 = nunca)
+input bool   F_UsarChop        = true;   // Modo cauteloso exige mais sinais
+input int    F_ChopMinSinais   = 3;      // Sinais exigidos no modo cauteloso
 
 //==================================================================
 //  VOTO 3 - VP_BREAKOUT
@@ -123,11 +150,7 @@ input double V_ValueAreaPct    = 70.0;
 input bool   V_UseTickVolume   = false;
 input double V_BreakBufferATR  = 0.10;
 input double V_MinVAWidthATR   = 1.00;
-input bool   V_UsarChop        = true;   // Modo cauteloso
-input int    V_ChopJanelaMin   = 30;
-input int    V_ChopPts         = 200;
-input int    V_ChopReversoes   = 2;
-input int    V_ChopHoldMin     = 20;
+input bool   V_UsarChop        = true;   // Modo cauteloso aumenta a folga
 input double V_ChopFator       = 2.0;
 
 //==================================================================
@@ -158,10 +181,15 @@ CTrade   trade;
 datetime lastBarTime = 0;
 datetime ordemBarra  = 0;   // barra em que a limite foi enviada
 int      ordemValid  = 0;   // validade dela em barras
+ENUM_ORDER_TYPE_TIME tipoValidade = ORDER_TIME_DAY;
 
-int      hMA_D = INVALID_HANDLE;
-int      hMA_F = INVALID_HANDLE;
-int      hATR  = INVALID_HANDLE;
+//--- ultimo consenso ja tratado (direcao + voto mais novo dele)
+int      consDir   = 0;
+datetime consChave = 0;
+
+int      hMA  = INVALID_HANDLE;
+int      hATR = INVALID_HANDLE;
+int      fitaSinaisAtivos = 0;
 
 //--- Delta: cache por barra (indice 0 = ultima fechada)
 long     dBar[], dCum[];
@@ -183,7 +211,7 @@ ulong    acumHistSeg = 0;
 long     acumVariacao = 0;
 ulong    ultimaAvaliacaoMs = 0;
 
-//--- VP: modo cauteloso
+//--- modo cauteloso
 datetime chopUltBarra = 0, chopAte = 0;
 bool     chopAtivo = false;
 
@@ -194,7 +222,20 @@ int OnInit()
 {
    trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints(InpSlippage);
-   trade.SetTypeFillingBySymbol(_Symbol);
+
+   //--- B3 (execucao em bolsa): RETURN deixa a limite no book.
+   //--- Em outro tipo de execucao, usa o que o simbolo permitir.
+   if(SymbolInfoInteger(_Symbol, SYMBOL_TRADE_EXEMODE) == SYMBOL_TRADE_EXECUTION_EXCHANGE)
+      trade.SetTypeFilling(ORDER_FILLING_RETURN);
+   else
+      trade.SetTypeFillingBySymbol(_Symbol);
+
+   //--- validade DAY se o ativo aceitar, senao GTC (a validade em barras e nossa)
+   int expModes = (int)SymbolInfoInteger(_Symbol, SYMBOL_EXPIRATION_MODE);
+   tipoValidade = ((expModes & SYMBOL_EXPIRATION_DAY) != 0) ? ORDER_TIME_DAY : ORDER_TIME_GTC;
+
+   if(AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
+      Print("Conta hedging: o EA continua operando uma posicao por vez");
 
    int ativos = (InpUsarDelta ? 1 : 0) + (InpUsarFita ? 1 : 0) +
                 (InpUsarVP ? 1 : 0) + (InpUsarAgressao ? 1 : 0);
@@ -206,7 +247,12 @@ int OnInit()
    if(InpStopPoints <= 0 || InpTakePoints <= 0 || InpVotoValidade < 1 ||
       InpValidade3 < 1 || InpValidade4 < 1 || InpDistancia < 0)
    {
-      Print("Stop, alvo, validades devem ser > 0 e distancia >= 0");
+      Print("Stop, alvo e validades devem ser > 0 e distancia >= 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(Minutos(InpInicio) >= Minutos(InpFimEntradas) && InpUseTimeFilter)
+   {
+      Print("Horario de inicio precisa ser antes do fim das entradas");
       return INIT_PARAMETERS_INCORRECT;
    }
    if(InpTakePoints < InpStopPoints)
@@ -214,21 +260,35 @@ int OnInit()
                   InpStopPoints, InpTakePoints,
                   100.0 * InpStopPoints / (InpStopPoints + InpTakePoints));
 
-   if(InpUsarDelta && D_FiltroTend)
+   if(InpUsarDelta && !D_UsarDivergencia && !D_UsarAbsorcao)
    {
-      hMA_D = iMA(_Symbol, D_TFTend, D_MAPeriodo, 0, D_MAMetodo, PRICE_CLOSE);
-      if(hMA_D == INVALID_HANDLE) return INIT_FAILED;
+      Print("Delta ligado sem nenhum sinal interno (divergencia/absorcao)");
+      return INIT_PARAMETERS_INCORRECT;
    }
-   if(InpUsarFita && F_FiltroTend)
+
+   fitaSinaisAtivos = (F_UsarGrandes ? 1 : 0) + (F_UsarVelocidade ? 1 : 0) + (F_UsarDesequil ? 1 : 0);
+   if(InpUsarFita && (F_MinSinais < 1 || F_MinSinais > fitaSinaisAtivos))
    {
-      // a Fita usa a mesma media (M15 EMA 50) por padrao
-      hMA_F = iMA(_Symbol, D_TFTend, D_MAPeriodo, 0, D_MAMetodo, PRICE_CLOSE);
-      if(hMA_F == INVALID_HANDLE) return INIT_FAILED;
+      PrintFormat("F_MinSinais (%d) precisa ficar entre 1 e %d (sinais da Fita ativos)",
+                  F_MinSinais, fitaSinaisAtivos);
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(C_JanelaMin < 5 || C_Pts <= 0 || C_Reversoes < 1 || C_HoldMin < 0 || V_ChopFator < 1.0)
+   {
+      Print("Parametros do modo cauteloso invalidos");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if((InpUsarDelta && D_FiltroTend) || (InpUsarFita && F_FiltroTend))
+   {
+      hMA = iMA(_Symbol, T_TF, T_Periodo, 0, T_Metodo, PRICE_CLOSE);
+      if(hMA == INVALID_HANDLE) { Print("Falha ao criar a media"); return INIT_FAILED; }
    }
    if(InpUsarVP)
    {
       hATR = iATR(_Symbol, PERIOD_M1, 14);
-      if(hATR == INVALID_HANDLE) return INIT_FAILED;
+      if(hATR == INVALID_HANDLE) { Print("Falha ao criar o ATR"); return INIT_FAILED; }
    }
 
    //--- Delta
@@ -259,9 +319,8 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
-   if(hMA_D != INVALID_HANDLE) IndicatorRelease(hMA_D);
-   if(hMA_F != INVALID_HANDLE) IndicatorRelease(hMA_F);
-   if(hATR  != INVALID_HANDLE) IndicatorRelease(hATR);
+   if(hMA  != INVALID_HANDLE) IndicatorRelease(hMA);
+   if(hATR != INVALID_HANDLE) IndicatorRelease(hATR);
 }
 
 //+------------------------------------------------------------------+
@@ -310,6 +369,8 @@ bool HorarioEntrada()
    return (m >= Minutos(InpInicio) && m < Minutos(InpFimEntradas));
 }
 
+datetime Dia(datetime t) { return t - (t % 86400); }
+
 //--- direcao da posicao do EA: +1, -1 ou 0
 int PosicaoDir(ulong &ticket)
 {
@@ -326,7 +387,7 @@ int PosicaoDir(ulong &ticket)
    return 0;
 }
 
-//--- direcao da ordem pendente do EA: +1, -1 ou 0
+//--- direcao da ordem pendente do EA: +1, -1 ou 0 (deixa a ordem selecionada)
 int OrdemDir(ulong &ticket)
 {
    ticket = 0;
@@ -356,42 +417,112 @@ void CancelarOrdens()
    ordemBarra = 0;
 }
 
-void Zerar()
+//--- true se ficou zerado
+bool Zerar()
 {
    CancelarOrdens();
    ulong t;
    for(int i = 0; i < 3 && PosicaoDir(t) != 0; i++)
-      if(!trade.PositionClose(t)) break;
+      if(!trade.PositionClose(t))
+      {
+         PrintFormat("Falha ao zerar: %u - %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
+         break;
+      }
+   return (PosicaoDir(t) == 0);
 }
 
-int Tendencia(int handle, int distMin)
+int Tendencia()
 {
-   if(handle == INVALID_HANDLE) return 0;
+   if(hMA == INVALID_HANDLE) return 0;
    double ma[];
    ArraySetAsSeries(ma, true);
-   if(CopyBuffer(handle, 0, 0, 1, ma) < 1 || ma[0] <= 0.0) return 0;
-   double preco = iClose(_Symbol, D_TFTend, 0);
+   if(CopyBuffer(hMA, 0, 0, 1, ma) < 1 || ma[0] <= 0.0) return 0;
+   double preco = iClose(_Symbol, T_TF, 0);
    if(preco <= 0.0) return 0;
    double dist = preco - ma[0];
-   if(MathAbs(dist) < distMin * _Point) return 0;
+   if(MathAbs(dist) < T_DistMin * _Point) return 0;
    return (dist > 0.0) ? 1 : -1;
 }
 
 void RegistrarVoto(int idx, int dir, datetime barra)
 {
    if(dir == 0) return;
+   bool repetido = (votos[idx].dir == dir && votos[idx].barra == barra);
    votos[idx].dir   = dir;
    votos[idx].barra = barra;
-   if(InpLog)
+   if(InpLog && !repetido)
       PrintFormat("VOTO %s -> %s", NOMES[idx], dir > 0 ? "COMPRA" : "VENDA");
 }
 
-//--- voto ainda dentro da validade?
+//--- voto ainda dentro da validade? (e do mesmo dia)
 bool VotoValido(int idx)
 {
    if(votos[idx].dir == 0 || votos[idx].barra == 0) return false;
+   if(Dia(votos[idx].barra) != Dia(TimeCurrent())) return false;
    int idade = iBarShift(_Symbol, PERIOD_M1, votos[idx].barra);
    return (idade >= 0 && idade <= InpVotoValidade);
+}
+
+//+==================================================================+
+//| MODO CAUTELOSO - mercado indo e voltando (VP e Fita)             |
+//+==================================================================+
+int ContarReversoes(const MqlRates &r[], int n, double limite)
+{
+   int dir = 0, rev = 0, iHi = 0, iLo = 0;
+   double ext = 0.0, hi = 0.0, lo = 0.0;
+   bool inicio = true;
+   for(int i = 0; i < n; i++)
+   {
+      bool alta = (r[i].close >= r[i].open);
+      for(int k = 0; k < 2; k++)
+      {
+         double p = (k == 0) ? (alta ? r[i].low : r[i].high) : (alta ? r[i].high : r[i].low);
+         int idx = i * 2 + k;
+         if(inicio) { hi = lo = p; iHi = iLo = idx; inicio = false; continue; }
+         if(dir == 0)
+         {
+            if(p > hi) { hi = p; iHi = idx; }
+            if(p < lo) { lo = p; iLo = idx; }
+            if(hi - lo >= limite) { dir = (iHi > iLo) ? 1 : -1; ext = (dir > 0) ? hi : lo; }
+         }
+         else if(dir == 1)
+         {
+            if(p > ext) ext = p;
+            else if(ext - p >= limite) { rev++; dir = -1; ext = p; }
+         }
+         else
+         {
+            if(p < ext) ext = p;
+            else if(p - ext >= limite) { rev++; dir = 1; ext = p; }
+         }
+      }
+   }
+   return rev;
+}
+
+//--- relida uma vez por barra M1
+bool ModoCauteloso()
+{
+   datetime t = iTime(_Symbol, PERIOD_M1, 0);
+   if(t > 0 && t != chopUltBarra)
+   {
+      chopUltBarra = t;
+      MqlRates r[];
+      ArraySetAsSeries(r, false);
+      int n = CopyRates(_Symbol, PERIOD_M1, 1, C_JanelaMin, r);
+      if(n >= C_JanelaMin / 2 && ContarReversoes(r, n, C_Pts * _Point) >= C_Reversoes)
+      {
+         if(!chopAtivo && InpLog) Print("MODO CAUTELOSO ligado");
+         chopAtivo = true;
+         chopAte   = TimeCurrent() + C_HoldMin * 60;
+      }
+   }
+   if(chopAtivo && TimeCurrent() >= chopAte)
+   {
+      chopAtivo = false;
+      if(InpLog) Print("Modo cauteloso desligado");
+   }
+   return chopAtivo;
 }
 
 //+==================================================================+
@@ -489,22 +620,24 @@ bool DoisPivos(bool topo, int &r, int &a)
    return false;
 }
 
-int D_Divergencia()
+//--- devolve a direcao e a hora do pivo; NAO marca o pivo como usado
+int D_Divergencia(datetime &pivo)
 {
    int r, a;
+   pivo = 0;
    if(DoisPivos(true, r, a) && r <= D_MaxPivotAge + D_PivotK)
    {
       bool precoSubiu = (iHigh(_Symbol, PERIOD_M1, r) - iHigh(_Symbol, PERIOD_M1, a)) >= D_MinPriceDiff * _Point;
       bool deltaCaiu  = (dCum[a - 1] - dCum[r - 1]) >= D_MinDeltaDiff;
       datetime tp = iTime(_Symbol, PERIOD_M1, r);
-      if(precoSubiu && deltaCaiu && tp != ultimoPivoTopo) { ultimoPivoTopo = tp; return -1; }
+      if(precoSubiu && deltaCaiu && tp != ultimoPivoTopo) { pivo = tp; return -1; }
    }
    if(DoisPivos(false, r, a) && r <= D_MaxPivotAge + D_PivotK)
    {
       bool precoCaiu  = (iLow(_Symbol, PERIOD_M1, a) - iLow(_Symbol, PERIOD_M1, r)) >= D_MinPriceDiff * _Point;
       bool deltaSubiu = (dCum[r - 1] - dCum[a - 1]) >= D_MinDeltaDiff;
       datetime tf = iTime(_Symbol, PERIOD_M1, r);
-      if(precoCaiu && deltaSubiu && tf != ultimoPivoFundo) { ultimoPivoFundo = tf; return 1; }
+      if(precoCaiu && deltaSubiu && tf != ultimoPivoFundo) { pivo = tf; return 1; }
    }
    return 0;
 }
@@ -514,18 +647,23 @@ int D_Absorcao()
    long   d     = dBar[0];
    double range = iHigh(_Symbol, PERIOD_M1, 1) - iLow(_Symbol, PERIOD_M1, 1);
    if(MathAbs(d) < D_DeltaMinimo || range > D_RangeMaximo * _Point) return 0;
-   return (d > 0) ? -1 : 1;
+   return (d > 0) ? -1 : 1;   // entra contra quem agrediu
 }
 
 int VotoDelta()
 {
    if(!D_AtualizarCache()) return 0;
-   int sDiv = D_UsarDivergencia ? D_Divergencia() : 0;
-   int sAbs = D_UsarAbsorcao    ? D_Absorcao()    : 0;
+   datetime pivo = 0;
+   int sDiv = D_UsarDivergencia ? D_Divergencia(pivo) : 0;
+   int sAbs = D_UsarAbsorcao    ? D_Absorcao()        : 0;
    if(sDiv == 0 && sAbs == 0) return 0;
    if(sDiv != 0 && sAbs != 0 && sDiv != sAbs) return 0;
    int dir = (sDiv != 0) ? sDiv : sAbs;
-   if(D_FiltroTend && Tendencia(hMA_D, D_MADistMin) != dir) return 0;
+   if(D_FiltroTend && Tendencia() != dir) return 0;
+
+   //--- so agora, com o voto saindo de fato, a divergencia e consumida
+   if(sDiv < 0) ultimoPivoTopo  = pivo;
+   if(sDiv > 0) ultimoPivoFundo = pivo;
    return dir;
 }
 
@@ -549,10 +687,10 @@ int LadoAgressor(const MqlTick &t, double &ultPreco)
    if(c != s) lado = c ? 1 : -1;
    else if(t.last > 0.0)
    {
-      if(t.ask > 0.0 && t.last >= t.ask)                 lado =  1;
-      else if(t.bid > 0.0 && t.last <= t.bid)            lado = -1;
-      else if(ultPreco > 0.0 && t.last > ultPreco)       lado =  1;
-      else if(ultPreco > 0.0 && t.last < ultPreco)       lado = -1;
+      if(t.ask > 0.0 && t.last >= t.ask)            lado =  1;
+      else if(t.bid > 0.0 && t.last <= t.bid)       lado = -1;
+      else if(ultPreco > 0.0 && t.last > ultPreco)  lado =  1;
+      else if(ultPreco > 0.0 && t.last < ultPreco)  lado = -1;
    }
    if(t.last > 0.0) ultPreco = t.last;
    return lado;
@@ -609,7 +747,7 @@ long DeltaNoIntervalo(ulong de, ulong ate)
 
 void F_AtualizarAcumulado(ulong agoraMs)
 {
-   if(!F_UsarAcumulado) return;
+   if(!F_UsarAcumulado || agoraMs == 0) return;
    datetime hoje = iTime(_Symbol, PERIOD_D1, 0);
    if(hoje != diaDoAcum) { diaDoAcum = hoje; acumAteMs = 0; deltaAcum = 0; }
    ulong ate = agoraMs - 1;
@@ -668,6 +806,7 @@ TapeStats LerFita(ulong fimMs)
 
 int VotoFita(ulong agoraMs)
 {
+   //--- acumulado e base andam sempre, mesmo sem sinal, para nao defasar
    F_AtualizarAcumulado(agoraMs);
    F_AtualizarBase(agoraMs);
 
@@ -681,9 +820,9 @@ int VotoFita(ulong agoraMs)
    if(F_UsarGrandes && MathAbs(t.volGrandesLiq) >= F_VolGrandesMin)
       s1 = (t.volGrandesLiq > 0) ? 1 : -1;
 
-   if(F_UsarVelocidade && baseCheios >= F_JanelaSeg * 4 && baseCheios > 0)
+   if(F_UsarVelocidade && baseCheios > 0 && baseCheios >= F_JanelaSeg * 4)
    {
-      double velBase = (double)baseTotal / baseCheios;
+      double velBase  = (double)baseTotal / baseCheios;
       double velCurta = (double)t.negocios / F_JanelaSeg;
       if(velBase > 0.0 && velCurta / velBase >= F_FatorVelocidade && MathAbs(saldo) >= 0.20)
          s2 = (saldo > 0) ? 1 : -1;
@@ -692,18 +831,23 @@ int VotoFita(ulong agoraMs)
    if(F_UsarDesequil && total >= F_VolMinJanela && MathAbs(saldo) >= F_DesequilMin)
       s3 = (saldo > 0) ? 1 : -1;
 
-   int compras = (s1 > 0) + (s2 > 0) + (s3 > 0);
-   int vendas  = (s1 < 0) + (s2 < 0) + (s3 < 0);
+   int compras = (s1 > 0 ? 1 : 0) + (s2 > 0 ? 1 : 0) + (s3 > 0 ? 1 : 0);
+   int vendas  = (s1 < 0 ? 1 : 0) + (s2 < 0 ? 1 : 0) + (s3 < 0 ? 1 : 0);
    if(compras > 0 && vendas > 0) return 0;
 
+   //--- mercado indo e voltando: exige mais sinais concordando
+   int minSinais = F_MinSinais;
+   if(F_UsarChop && ModoCauteloso())
+      minSinais = MathMin(MathMax(F_ChopMinSinais, F_MinSinais), fitaSinaisAtivos);
+
    int dir = 0;
-   if(compras >= F_MinSinais) dir = 1;
-   else if(vendas >= F_MinSinais) dir = -1;
+   if(compras >= minSinais) dir = 1;
+   else if(vendas >= minSinais) dir = -1;
    if(dir == 0) return 0;
 
    int concordam = (dir > 0) ? compras : vendas;
    bool ignoraTend = (F_SinaisIgnoraTend > 0 && concordam >= F_SinaisIgnoraTend);
-   if(F_FiltroTend && !ignoraTend && Tendencia(hMA_F, D_MADistMin) != dir) return 0;
+   if(F_FiltroTend && !ignoraTend && Tendencia() != dir) return 0;
 
    int acum = F_LadoAcumulado();
    if(acum != 0 && acum != dir) return 0;
@@ -735,14 +879,11 @@ bool CalcProfile(double &vah, double &val)
       if(v <= 0.0) v = (double)r[i].tick_volume;
       if(v <= 0.0) continue;
       double br = r[i].high - r[i].low;
-      if(br <= 0.0)
-      {
-         int idx = (int)MathMin(MathMax((int)MathFloor((r[i].low - lo) / bin), 0), V_Bins - 1);
-         vol[idx] += v;
-         continue;
-      }
-      int f = (int)MathMin(MathMax((int)MathFloor((r[i].low  - lo) / bin), 0), V_Bins - 1);
-      int l = (int)MathMin(MathMax((int)MathFloor((r[i].high - lo) / bin), 0), V_Bins - 1);
+      int f = (int)MathFloor((r[i].low  - lo) / bin);
+      int l = (int)MathFloor((r[i].high - lo) / bin);
+      f = (int)MathMin(MathMax(f, 0), V_Bins - 1);
+      l = (int)MathMin(MathMax(l, 0), V_Bins - 1);
+      if(br <= 0.0) { vol[f] += v; continue; }
       for(int b = f; b <= l; b++)
       {
          double bl = lo + b * bin;
@@ -771,60 +912,6 @@ bool CalcProfile(double &vah, double &val)
    return true;
 }
 
-int ContarReversoes(const MqlRates &r[], int n, double limite)
-{
-   int dir = 0, rev = 0, iHi = 0, iLo = 0;
-   double ext = 0.0, hi = 0.0, lo = 0.0;
-   bool inicio = true;
-   for(int i = 0; i < n; i++)
-   {
-      bool alta = (r[i].close >= r[i].open);
-      for(int k = 0; k < 2; k++)
-      {
-         double p = (k == 0) ? (alta ? r[i].low : r[i].high) : (alta ? r[i].high : r[i].low);
-         int idx = i * 2 + k;
-         if(inicio) { hi = lo = p; iHi = iLo = idx; inicio = false; continue; }
-         if(dir == 0)
-         {
-            if(p > hi) { hi = p; iHi = idx; }
-            if(p < lo) { lo = p; iLo = idx; }
-            if(hi - lo >= limite) { dir = (iHi > iLo) ? 1 : -1; ext = (dir > 0) ? hi : lo; }
-         }
-         else if(dir == 1)
-         {
-            if(p > ext) ext = p;
-            else if(ext - p >= limite) { rev++; dir = -1; ext = p; }
-         }
-         else
-         {
-            if(p < ext) ext = p;
-            else if(p - ext >= limite) { rev++; dir = 1; ext = p; }
-         }
-      }
-   }
-   return rev;
-}
-
-bool ModoCauteloso()
-{
-   if(!V_UsarChop) return false;
-   datetime t = iTime(_Symbol, PERIOD_M1, 0);
-   if(t > 0 && t != chopUltBarra)
-   {
-      chopUltBarra = t;
-      MqlRates r[];
-      ArraySetAsSeries(r, false);
-      int n = CopyRates(_Symbol, PERIOD_M1, 1, V_ChopJanelaMin, r);
-      if(n >= V_ChopJanelaMin / 2 && ContarReversoes(r, n, V_ChopPts * _Point) >= V_ChopReversoes)
-      {
-         chopAtivo = true;
-         chopAte   = TimeCurrent() + V_ChopHoldMin * 60;
-      }
-   }
-   if(chopAtivo && TimeCurrent() >= chopAte) chopAtivo = false;
-   return chopAtivo;
-}
-
 int VotoVP()
 {
    double atr[];
@@ -835,7 +922,8 @@ int VotoVP()
    if(!CalcProfile(vah, val)) return 0;
    if(vah - val < V_MinVAWidthATR * atr[0]) return 0;
 
-   double buffer = V_BreakBufferATR * atr[0] * (ModoCauteloso() ? V_ChopFator : 1.0);
+   bool caut = V_UsarChop && ModoCauteloso();
+   double buffer = V_BreakBufferATR * atr[0] * (caut ? V_ChopFator : 1.0);
    double c1 = iClose(_Symbol, PERIOD_M1, 1);
    if(c1 > vah + buffer) return 1;
    if(c1 < val - buffer) return -1;
@@ -937,12 +1025,12 @@ int VotoAgressao()
 //+==================================================================+
 //| ORDEM                                                            |
 //+==================================================================+
-void EnviarLimite(int dir, int nVotos)
+bool EnviarLimite(int dir, int nVotos)
 {
    double c1 = iClose(_Symbol, PERIOD_M1, 1);
    double h1 = iHigh(_Symbol,  PERIOD_M1, 1);
    double l1 = iLow(_Symbol,   PERIOD_M1, 1);
-   if(c1 <= 0.0) return;
+   if(c1 <= 0.0) return false;
 
    double preco;
    if(InpModoPreco == PRECO_FECHAMENTO) preco = c1;
@@ -957,35 +1045,54 @@ void EnviarLimite(int dir, int nVotos)
 
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(ask <= 0.0 || bid <= 0.0)
+   if(ask <= 0.0 || bid <= 0.0 || ask < bid)
    {
-      Print("Cotacao indisponivel - ordem ignorada");
-      return;
+      PrintFormat("Cotacao indisponivel (ask=%.0f bid=%.0f) - ordem ignorada", ask, bid);
+      return false;
    }
 
-   bool ok;
+   bool ok, mercado = false;
    //--- preco ja passou do limite: na B3 a limite executaria na hora,
    //--- mas o MT5 recusa BuyLimit acima do ask. Entra a mercado.
    if(dir > 0 && ask <= preco)
+   {
+      mercado = true;
       ok = trade.Buy(lots, _Symbol, 0.0, NormalizePrice(ask - InpStopPoints * _Point),
                      NormalizePrice(ask + InpTakePoints * _Point), cmt);
+   }
    else if(dir < 0 && bid >= preco)
+   {
+      mercado = true;
       ok = trade.Sell(lots, _Symbol, 0.0, NormalizePrice(bid + InpStopPoints * _Point),
                       NormalizePrice(bid - InpTakePoints * _Point), cmt);
-   else
-      ok = (dir > 0) ? trade.BuyLimit (lots, preco, _Symbol, stop, alvo, ORDER_TIME_DAY, 0, cmt)
-                     : trade.SellLimit(lots, preco, _Symbol, stop, alvo, ORDER_TIME_DAY, 0, cmt);
-
-   if(!ok)
-   {
-      PrintFormat("Falha na ordem: %u - %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
-      return;
    }
-   ordemBarra = iTime(_Symbol, PERIOD_M1, 0);
-   ordemValid = valid;
-   if(InpLog)
-      PrintFormat(">>> %s LIMITE em %.0f | %d votos | validade %d barras | SL %.0f | TP %.0f",
-                  dir > 0 ? "COMPRA" : "VENDA", preco, nVotos, valid, stop, alvo);
+   else
+      ok = (dir > 0) ? trade.BuyLimit (lots, preco, _Symbol, stop, alvo, tipoValidade, 0, cmt)
+                     : trade.SellLimit(lots, preco, _Symbol, stop, alvo, tipoValidade, 0, cmt);
+
+   uint rc = trade.ResultRetcode();
+   if(!ok || (rc != TRADE_RETCODE_DONE && rc != TRADE_RETCODE_PLACED && rc != TRADE_RETCODE_DONE_PARTIAL))
+   {
+      PrintFormat("Falha na ordem: %u - %s", rc, trade.ResultRetcodeDescription());
+      return false;
+   }
+
+   if(mercado)
+   {
+      ordemBarra = 0;
+      if(InpLog)
+         PrintFormat(">>> %s A MERCADO (preco ja alem da limite %.0f) | %d votos",
+                     dir > 0 ? "COMPRA" : "VENDA", preco, nVotos);
+   }
+   else
+   {
+      ordemBarra = iTime(_Symbol, PERIOD_M1, 0);
+      ordemValid = valid;
+      if(InpLog)
+         PrintFormat(">>> %s LIMITE em %.0f | %d votos | validade %d barras | SL %.0f | TP %.0f",
+                     dir > 0 ? "COMPRA" : "VENDA", preco, nVotos, valid, stop, alvo);
+   }
+   return true;
 }
 
 void CancelarVencida()
@@ -994,18 +1101,22 @@ void CancelarVencida()
    if(OrdemDir(t) == 0) { ordemBarra = 0; return; }
    if(ordemBarra == 0)
    {
-      // ordem de antes de recarregar o EA: usa a hora de criacao
+      //--- ordem de antes de recarregar o EA: usa a hora de criacao
       ordemBarra = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
       ordemValid = InpValidade3;
    }
    int barras = Bars(_Symbol, PERIOD_M1, ordemBarra, TimeCurrent()) - 1;
    if(barras >= ordemValid)
    {
-      trade.OrderDelete(t);
-      ordemBarra = 0;
-      if(InpLog) PrintFormat("Limite cancelada: %d barras sem execucao", ordemValid);
+      if(trade.OrderDelete(t))
+      {
+         ordemBarra = 0;
+         if(InpLog) PrintFormat("Limite cancelada: %d barras sem execucao", ordemValid);
+      }
    }
 }
+
+void MarcarConsenso(int dir, datetime chave) { consDir = dir; consChave = chave; }
 
 //+==================================================================+
 //| CONSENSO (a cada barra M1 nova)                                  |
@@ -1023,20 +1134,26 @@ void NovaBarra()
 
    //--- conta os votos validos
    int compras = 0, vendas = 0;
-   bool novo = false;      // algum voto do consenso nasceu na barra que fechou?
    for(int v = 0; v < NVOTOS; v++)
    {
       if(!VotoValido(v)) continue;
       if(votos[v].dir > 0) compras++; else vendas++;
    }
+
    int dir = 0, n = 0;
-   if(compras >= InpVotosMin)     { dir =  1; n = compras; }
-   else if(vendas >= InpVotosMin) { dir = -1; n = vendas;  }
+   bool cBuy = (compras >= InpVotosMin), cSell = (vendas >= InpVotosMin);
+   if(cBuy && cSell) return;                 // empate: nao opera
+   if(cBuy)  { dir =  1; n = compras; }
+   if(cSell) { dir = -1; n = vendas;  }
    if(dir == 0) return;
 
+   //--- chave = voto mais novo do lado vencedor. Consenso com a mesma
+   //--- chave ja foi tratado; so age quando entra voto novo.
+   datetime chave = 0;
    for(int v = 0; v < NVOTOS; v++)
-      if(VotoValido(v) && votos[v].dir == dir && votos[v].barra == b1) novo = true;
-   if(!novo) return;   // consenso velho: ja foi tratado
+      if(VotoValido(v) && votos[v].dir == dir && votos[v].barra > chave)
+         chave = votos[v].barra;
+   if(dir == consDir && chave <= consChave) return;
 
    if(InpLog)
       PrintFormat("CONSENSO %s: %d votos (compra %d x venda %d)",
@@ -1044,24 +1161,24 @@ void NovaBarra()
 
    ulong pt, ot;
    int pos = PosicaoDir(pt);
-   int ord = OrdemDir(ot);
 
-   if(pos == dir) return;          // ja posicionado a favor: segue stop/alvo
-   if(ord == dir) return;          // ja tem limite do mesmo lado: mantem
+   if(pos == dir) { MarcarConsenso(dir, chave); return; }   // ja a favor: segue stop/alvo
 
-   if(pos != 0)                    // posicao contraria: reversao
+   if(pos != 0)                                              // posicao contraria
    {
-      if(!InpReverter) return;
+      if(!InpReverter) { MarcarConsenso(dir, chave); return; }
       if(InpLog) Print("REVERSAO: zerando posicao contraria");
-      Zerar();
-      ulong tmp;
-      if(PosicaoDir(tmp) != 0) return;   // nao conseguiu zerar
+      if(!Zerar()) return;                                   // tenta de novo na proxima barra
    }
-   else if(ord != 0)               // limite do outro lado: troca
-      CancelarOrdens();
 
-   if(pos == 0 && !HorarioEntrada()) return;   // reversao vale fora do horario de entrada
-   EnviarLimite(dir, n);
+   int ord = OrdemDir(ot);
+   if(ord == dir) { MarcarConsenso(dir, chave); return; }    // limite do mesmo lado: mantem
+   if(ord != 0) CancelarOrdens();                            // limite do outro lado: troca
+
+   //--- zerar vale sempre; abrir, so no horario de entrada
+   if(!HorarioEntrada()) { MarcarConsenso(dir, chave); return; }
+
+   if(EnviarLimite(dir, n)) MarcarConsenso(dir, chave);
 }
 
 //+------------------------------------------------------------------+
@@ -1069,7 +1186,8 @@ void OnTick()
 {
    if(InpZerarFimDia && MinutosAgora() >= Minutos(InpZerar))
    {
-      Zerar();
+      ulong t, o;
+      if(PosicaoDir(t) != 0 || OrdemDir(o) != 0) Zerar();
       return;
    }
 
@@ -1081,17 +1199,14 @@ void OnTick()
          agora.time_msc - ultimaAvaliacaoMs >= 1000)
       {
          ultimaAvaliacaoMs = agora.time_msc;
-         int f = VotoFita(agora.time_msc);
-         // voto pertence a barra corrente; vira "da barra fechada" no proximo NovaBarra
-         if(f != 0 && (f != votos[1].dir || votos[1].barra != iTime(_Symbol, PERIOD_M1, 0)))
-            RegistrarVoto(1, f, iTime(_Symbol, PERIOD_M1, 0));
+         RegistrarVoto(1, VotoFita(agora.time_msc), iTime(_Symbol, PERIOD_M1, 0));
       }
    }
 
-   datetime t = iTime(_Symbol, PERIOD_M1, 0);
-   if(t != lastBarTime)
+   datetime b0 = iTime(_Symbol, PERIOD_M1, 0);
+   if(b0 != lastBarTime)
    {
-      lastBarTime = t;
+      lastBarTime = b0;
       NovaBarra();
    }
 }
