@@ -44,9 +44,13 @@
 //|  v1.02 - painel no grafico: cada robo COMPRADO / VENDIDO /        |
 //|          SEM SINAL, placar de votos e status. Resumo no log a     |
 //|          cada barra em que os votos mudam.                        |
+//|                                                                   |
+//|  v1.03 - padroes para mais entradas: voto vale 5 barras, limite  |
+//|          no fechamento (distancia 0), Agressao com fator 2.0,     |
+//|          filtro de tendencia do Delta e da Fita desligados.       |
 //+------------------------------------------------------------------+
 #property copyright "Maikon"
-#property version   "1.02"
+#property version   "1.03"
 
 #include <Trade\Trade.mqh>
 
@@ -61,15 +65,15 @@ enum EModoPreco
 
 input group "Consenso"
 input int        InpVotosMin      = 3;      // Votos do mesmo lado para entrar (3 de 4)
-input int        InpVotoValidade  = 3;      // Barras M1 que um voto continua valendo
+input int        InpVotoValidade  = 5;      // Barras M1 que um voto continua valendo
 input bool       InpUsarDelta     = true;   // Voto 1: Delta_Fluxo
 input bool       InpUsarFita      = true;   // Voto 2: Fita
 input bool       InpUsarVP        = true;   // Voto 3: VP_Breakout
 input bool       InpUsarAgressao  = true;   // Voto 4: Agressao
 
 input group "Ordem limite"
-input EModoPreco InpModoPreco     = PRECO_EXTREMO; // Preco da ordem limite
-input int        InpDistancia     = 50;     // Distancia da maxima/minima (pontos)
+input EModoPreco InpModoPreco     = PRECO_FECHAMENTO; // Preco da ordem limite
+input int        InpDistancia     = 0;      // Distancia da maxima/minima (pontos)
 input int        InpValidade4     = 4;      // Validade com 4 votos (barras)
 input int        InpValidade3     = 3;      // Validade com 3 votos (barras)
 input double     InpLots          = 1.0;    // Contratos
@@ -126,7 +130,7 @@ input int    D_PivotK          = 2;      // Barras de cada lado do pivo
 input int    D_MaxPivotAge     = 5;      // Idade maxima do pivo recente
 input double D_MinPriceDiff    = 30;     // Diferenca minima de preco (pontos)
 input long   D_MinDeltaDiff    = 200;    // Diferenca minima de delta
-input bool   D_FiltroTend      = true;   // So a favor da media
+input bool   D_FiltroTend      = false;  // So a favor da media
 
 //==================================================================
 //  VOTO 2 - FITA
@@ -148,7 +152,7 @@ input long   F_VolMinJanela    = 300;
 input bool   F_UsarAcumulado   = true;   // Barra sinal contra a variacao do acumulado
 input int    F_AcumJanelaSeg   = 600;
 input long   F_AcumMinimo      = 500;
-input bool   F_FiltroTend      = true;
+input bool   F_FiltroTend      = false;
 input int    F_SinaisIgnoraTend= 3;      // N sinais internos ignoram a tendencia (0 = nunca)
 input bool   F_UsarChop        = true;   // Modo cauteloso exige mais sinais
 input int    F_ChopMinSinais   = 3;      // Sinais exigidos no modo cauteloso
@@ -172,7 +176,7 @@ input double V_ChopFator       = 2.0;
 input group "Voto 4 - Agressao"
 input int    A_JanelaSeg       = 10;
 input int    A_NiveisMin       = 3;
-input double A_FatorVolume     = 3.0;
+input double A_FatorVolume     = 2.0;
 input double A_DominioPct      = 70;
 input int    A_MediaN          = 30;
 input bool   A_ExigirSustentar = true;
