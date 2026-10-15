@@ -52,9 +52,13 @@
 //|                                                                   |
 //|  v1.04 - limite a 200 pontos. A distancia passa a valer tambem    |
 //|          no modo fechamento (compra fech - dist / venda fech +).  |
+//|                                                                   |
+//|  v1.05 - painel mostra a LEITURA ao vivo de cada robo (mesmo sem  |
+//|          votar) e se ha ticks de negocio com lado agressor.       |
+//|          Sem eles Delta/Fita/Agressao ficam parados.              |
 //+------------------------------------------------------------------+
 #property copyright "Maikon"
-#property version   "1.04"
+#property version   "1.05"
 
 #include <Trade\Trade.mqh>
 
@@ -240,6 +244,10 @@ bool     chopAtivo = false;
 #define  PFX "CONS_"
 bool     painelAtivo = false;
 datetime painelUltSeg = 0;
+string   leitura[NVOTOS];   // o que cada robo esta lendo agora (painel)
+int      diagTicks = -1;    // negocios na ultima barra fechada
+double   diagFlagsPct = 0;  // % desses negocios com lado agressor
+bool     avisoTicks = false;
 
 //+------------------------------------------------------------------+
 //| INIT                                                             |
@@ -685,7 +693,9 @@ int D_Absorcao()
 
 int VotoDelta()
 {
-   if(!D_AtualizarCache()) return 0;
+   if(!D_AtualizarCache()) { leitura[0] = "sem dados"; return 0; }
+   leitura[0] = StringFormat("delta %+d | range %.0f", (int)dBar[0],
+                             (iHigh(_Symbol, PERIOD_M1, 1) - iLow(_Symbol, PERIOD_M1, 1)) / _Point);
    datetime pivo = 0;
    int sDiv = D_UsarDivergencia ? D_Divergencia(pivo) : 0;
    int sAbs = D_UsarAbsorcao    ? D_Absorcao()        : 0;
@@ -844,7 +854,11 @@ int VotoFita(ulong agoraMs)
    F_AtualizarBase(agoraMs);
 
    TapeStats t = LerFita(agoraMs);
-   if(!t.valido || t.negocios < F_MinNegocios) return 0;
+   if(!t.valido || t.negocios < F_MinNegocios)
+   {
+      leitura[1] = StringFormat("fita rala (%d negocios em %ds)", t.negocios, F_JanelaSeg);
+      return 0;
+   }
    long total = t.volCompra + t.volVenda + t.volNeutro;
    if(total <= 0) return 0;
    double saldo = (double)(t.volCompra - t.volVenda) / total;
@@ -853,13 +867,14 @@ int VotoFita(ulong agoraMs)
    if(F_UsarGrandes && MathAbs(t.volGrandesLiq) >= F_VolGrandesMin)
       s1 = (t.volGrandesLiq > 0) ? 1 : -1;
 
-   if(F_UsarVelocidade && baseCheios > 0 && baseCheios >= F_JanelaSeg * 4)
-   {
-      double velBase  = (double)baseTotal / baseCheios;
-      double velCurta = (double)t.negocios / F_JanelaSeg;
-      if(velBase > 0.0 && velCurta / velBase >= F_FatorVelocidade && MathAbs(saldo) >= 0.20)
-         s2 = (saldo > 0) ? 1 : -1;
-   }
+   double velBase = (baseCheios > 0) ? (double)baseTotal / baseCheios : 0.0;
+   double fator   = (velBase > 0.0) ? ((double)t.negocios / F_JanelaSeg) / velBase : 0.0;
+   if(F_UsarVelocidade && baseCheios >= F_JanelaSeg * 4 &&
+      fator >= F_FatorVelocidade && MathAbs(saldo) >= 0.20)
+      s2 = (saldo > 0) ? 1 : -1;
+
+   leitura[1] = StringFormat("saldo %+.0f%% | vel %.1fx | grandes %+d",
+                             saldo * 100.0, fator, (int)t.volGrandesLiq);
 
    if(F_UsarDesequil && total >= F_VolMinJanela && MathAbs(saldo) >= F_DesequilMin)
       s3 = (saldo > 0) ? 1 : -1;
@@ -949,15 +964,20 @@ int VotoVP()
 {
    double atr[];
    ArraySetAsSeries(atr, true);
-   if(CopyBuffer(hATR, 0, 1, 1, atr) < 1 || atr[0] <= 0.0) return 0;
+   if(CopyBuffer(hATR, 0, 1, 1, atr) < 1 || atr[0] <= 0.0) { leitura[2] = "sem ATR"; return 0; }
 
    double vah, val;
-   if(!CalcProfile(vah, val)) return 0;
-   if(vah - val < V_MinVAWidthATR * atr[0]) return 0;
+   if(!CalcProfile(vah, val)) { leitura[2] = "historico insuficiente"; return 0; }
+   if(vah - val < V_MinVAWidthATR * atr[0])
+   {
+      leitura[2] = StringFormat("VA estreita (%.0f pts)", (vah - val) / _Point);
+      return 0;
+   }
 
    bool caut = V_UsarChop && ModoCauteloso();
    double buffer = V_BreakBufferATR * atr[0] * (caut ? V_ChopFator : 1.0);
    double c1 = iClose(_Symbol, PERIOD_M1, 1);
+   leitura[2] = StringFormat("VAL %.0f | VAH %.0f", val, vah);
    if(c1 > vah + buffer) return 1;
    if(c1 < val - buffer) return -1;
    return 0;
@@ -983,7 +1003,7 @@ int VotoAgressao()
    ulong de  = (ulong)r[0].time * 1000;
    ulong ate = (ulong)(r[0].time + 60) * 1000 - 1;
    int n = CopyTicksRange(_Symbol, tk, COPY_TICKS_TRADE, de, ate);
-   if(n < 2) return 0;
+   if(n < 2) { leitura[3] = "sem negocios na barra"; return 0; }
 
    bool temFlags = false;
    for(int i = 0; i < n && !temFlags; i++)
@@ -1017,6 +1037,7 @@ int VotoAgressao()
    double melhorIni = 0;
    int    fim = 0;
    double vc = 0, vv = 0;
+   double pico = 0;   // maior volume de janela / volume normal da janela
 
    for(int ini = 0; ini < n; ini++)
    {
@@ -1029,6 +1050,7 @@ int VotoAgressao()
          fim++;
       }
       double total = vc + vv;
+      if(volJanela > 0 && total / volJanela > pico) pico = total / volJanela;
       if(total > 0 && total >= A_FatorVolume * volJanela)
       {
          double p0 = tk[ini].last, mx = p0, mn = p0;
@@ -1046,6 +1068,7 @@ int VotoAgressao()
       if(lado[ini] < 0) vv -= v0;
    }
 
+   leitura[3] = StringFormat("pico %.1fx do volume (precisa %.1fx)", pico, A_FatorVolume);
    if(melhorDir == 0) return 0;
    if(A_ExigirSustentar)
    {
@@ -1252,8 +1275,8 @@ void AtualizarPainel(bool forcar = false)
    painelUltSeg = agora;
 
    int x = InpPainelX, y = InpPainelY, lh = 17;
-   int alt = 34 + NVOTOS * lh + 3 * lh + 12;
-   Fundo(x, y, 300, alt);
+   int alt = 34 + NVOTOS * lh + 4 * lh + 12;
+   Fundo(x, y, 440, alt);
    Rotulo("tit", x + 10, y + 8, "CONSENSO WIN", InpCorTexto, 10);
 
    int compras = 0, vendas = 0;
@@ -1271,11 +1294,12 @@ void AtualizarPainel(bool forcar = false)
          if(c) compras++; else vendas++;
          cor = c ? InpCorCompra : InpCorVenda;
          int resta = InpVotoValidade - iBarShift(_Symbol, PERIOD_M1, votos[v].barra);
-         ext = (resta > 0) ? StringFormat("(vale +%d)", resta) : "(ultima barra)";
+         ext = (resta > 0) ? StringFormat("(vale +%d)", resta) : "(ultima)";
       }
       Rotulo("n" + IntegerToString(v), x + 10,  yy, NOMES[v], InpCorTexto);
       Rotulo("e" + IntegerToString(v), x + 95,  yy, est, cor);
-      Rotulo("x" + IntegerToString(v), x + 185, yy, ext, InpCorTexto, 8);
+      Rotulo("x" + IntegerToString(v), x + 165, yy, ext, InpCorTexto, 8);
+      Rotulo("l" + IntegerToString(v), x + 235, yy, VotoAtivo(v) ? leitura[v] : "", clrGray, 8);
    }
 
    int   yb = y + 34 + NVOTOS * lh + 6;
@@ -1311,7 +1335,50 @@ void AtualizarPainel(bool forcar = false)
           chopAtivo ? "Modo cauteloso LIGADO" : "Modo cauteloso desligado",
           chopAtivo ? clrGoldenrod : clrDimGray, 8);
 
+   //--- dados: sem ticks de negocio, Delta/Fita/Agressao nao tem o que ler
+   string dg;
+   color  cd = clrDimGray;
+   if(diagTicks < 0)
+      dg = "Ticks: aguardando a primeira barra";
+   else if(diagTicks == 0)
+   {
+      dg = "SEM TICKS DE NEGOCIO - Delta, Fita e Agressao parados";
+      cd = InpCorVenda;
+   }
+   else if(diagFlagsPct < 50.0)
+   {
+      dg = StringFormat("Ticks: %d | so %.0f%% com agressor - Delta nao funciona", diagTicks, diagFlagsPct);
+      cd = clrGoldenrod;
+   }
+   else
+      dg = StringFormat("Ticks na ultima barra: %d | %.0f%% com agressor", diagTicks, diagFlagsPct);
+   Rotulo("diag", x + 10, yb + 3 * lh, dg, cd, 8);
+
    ChartRedraw(0);
+}
+
+//--- confere se a barra que fechou trouxe negocios com lado agressor
+void DiagnosticoTicks()
+{
+   datetime b1 = iTime(_Symbol, PERIOD_M1, 1);
+   if(b1 <= 0) return;
+   MqlTick tk[];
+   int n = CopyTicksRange(_Symbol, tk, COPY_TICKS_TRADE,
+                          (ulong)b1 * 1000, (ulong)(b1 + 60) * 1000 - 1);
+   int comFlag = 0;
+   for(int i = 0; i < n; i++)
+      if((tk[i].flags & (TICK_FLAG_BUY | TICK_FLAG_SELL)) != 0) comFlag++;
+   diagTicks    = MathMax(n, 0);
+   diagFlagsPct = (n > 0) ? 100.0 * comFlag / n : 0.0;
+
+   if(!avisoTicks && HorarioEntrada() && (n <= 0 || comFlag == 0))
+   {
+      avisoTicks = true;
+      Print("ATENCAO: ", (n <= 0) ? "a barra nao tem ticks de negocio" : "os ticks nao trazem o lado agressor",
+            ". Delta precisa do lado agressor; Fita e Agressao precisam dos negocios. ",
+            "No testador use 'Cada tick com base em ticks reais'. ",
+            "Em serie continua (WIN$, WIN$N) teste no contrato vigente.");
+   }
 }
 
 //+==================================================================+
@@ -1320,6 +1387,7 @@ void AtualizarPainel(bool forcar = false)
 void NovaBarra()
 {
    datetime b1 = iTime(_Symbol, PERIOD_M1, 1);
+   DiagnosticoTicks();
 
    //--- votos das estrategias de barra, sobre a barra que fechou
    if(InpUsarDelta)    RegistrarVoto(0, VotoDelta(),    b1);
