@@ -13,7 +13,7 @@
 //|  (K1..K6). Liga/desliga cada um em UsarK1..UsarK6.                |
 //|                                                                   |
 //|  COMO USAR                                                        |
-//|   - Grafico base: WIN em 1 minuto.                                |
+//|   - Grafico base: WIN em 1 minuto (AcumJanela conta minutos).    |
 //|   - Automacao: "Realizar envio de ordens no fechamento do candle".|
 //|   - Quantidade: campo "Quantidade por Ordem" da automacao.        |
 //|   - Requer Profit Ultra ou Automacao 2.0 (Asset com periodo Kagi  |
@@ -24,6 +24,9 @@
 //|  v1.00 - primeira versao                                          |
 //|  v1.01 - gatilho pelo tamanho da perna do Kagi (maxima - minima)  |
 //|          e fita pelo saldo ACUMULADO de agressao do dia.          |
+//|  v1.02 - acumulado igual ao do MQL5: delta (agressao compradora - |
+//|          vendedora) acumulado no dia; o lado e a VARIACAO dele    |
+//|          nos ultimos AcumJanela minutos (+500 compra, -500 venda).|
 //+------------------------------------------------------------------+
 input
   // --- 6 Kagi (ativo, bolsa, periodo Kagi, tamanho da reversao) ---
@@ -41,10 +44,9 @@ input
   UsarK6(true);
   PernaPts(200);       // Perna do Kagi contra a fita (maxima - minima, pontos)
 
-  // --- Fita (acumulado do dia) ---
-  FonteFita(1);        // 1 = Saldo acumulado de agressao TR | 2 = PowerMeter do dia
-  SaldoMin(0);         // FonteFita 1: saldo minimo (contratos) para valer compra/venda
-  FatorFita(1.2);      // FonteFita 2: lado precisa ser X vezes maior que o outro
+  // --- Fita: acumulado (igual ao Consenso_WIN do MQL5) ---
+  AcumJanela(10);      // Variacao do acumulado nos ultimos X minutos (MQL5: 600 seg)
+  AcumMinimo(500);     // Variacao minima em contratos para valer compra/venda
 
   // --- Ordem ---
   StopPts(120);        // Stop (pontos)
@@ -60,7 +62,8 @@ input
 var
   p1, p2, p3, p4, p5, p6         : Float;    // perna de cada Kagi: + alta, - queda (pontos)
   nAlta, nQueda                  : Integer;  // Kagi cuja perna acabou de chegar a PernaPts
-  saldo, agrC, agrV              : Float;
+  acum, variacao                 : Float;    // delta acumulado do dia e sua variacao
+  dia                            : Integer;
   fitaCompra, fitaVenda          : Boolean;
   sinalCompra, sinalVenda        : Boolean;
   horarioOk                      : Boolean;
@@ -105,21 +108,21 @@ begin
   if (p6 <= -PernaPts) and (p6[1] > -PernaPts) then nQueda := nQueda + 1;
 
   //================================================================
-  //  FITA: acumulado do dia
+  //  FITA: acumulado (mesma regra do Consenso_WIN no MQL5)
+  //  acum = agressao compradora - vendedora acumulada no dia (contratos)
+  //  Lado = variacao do acum nos ultimos AcumJanela minutos:
+  //    subiu AcumMinimo ou mais  -> compra
+  //    caiu  AcumMinimo ou mais  -> venda
+  //  No comeco do dia, antes de completar a janela, fica neutro.
   //================================================================
-  if FonteFita = 1 then
-  begin
-    saldo := AccAgressSaldo(1);   // saldo acumulado em contratos
-    fitaCompra := saldo > SaldoMin;
-    fitaVenda  := saldo < -SaldoMin;
-  end
-  else
-  begin
-    agrC := PowerMeter(osBuy);
-    agrV := PowerMeter(osSell);
-    fitaCompra := (agrC > 0) and (agrC >= agrV * FatorFita);
-    fitaVenda  := (agrV > 0) and (agrV >= agrC * FatorFita);
-  end;
+  acum := AccAgressSaldo(1);
+  dia := Date;
+  variacao := 0;
+  if dia[AcumJanela] = dia then
+    variacao := acum - acum[AcumJanela];
+
+  fitaCompra := variacao >= AcumMinimo;
+  fitaVenda  := variacao <= -AcumMinimo;
 
   //================================================================
   //  SINAIS (correcao contra o Kagi, a favor da fita)
