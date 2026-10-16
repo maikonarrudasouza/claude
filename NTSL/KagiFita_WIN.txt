@@ -2,10 +2,12 @@
 //|  KagiFita_WIN  -  Estrategia de execucao NTSL (Profit)            |
 //|                                                                   |
 //|  CORRECAO A FAVOR DA FITA                                         |
-//|   - Fita VENDENDO  + um Kagi VIRA PARA CIMA  -> vende a mercado   |
-//|   - Fita COMPRANDO + um Kagi VIRA PARA BAIXO -> compra a mercado  |
-//|  O Kagi mostra o preco andando contra a fita; o robo entra do     |
-//|  lado da fita esperando a correcao.                               |
+//|   - Acumulado da fita COMPRADOR e a perna de QUEDA do Kagi        |
+//|     chega a 200 pontos (maxima - minima) -> COMPRA a mercado.     |
+//|   - Acumulado VENDEDOR e a perna de ALTA do Kagi chega a 200      |
+//|     pontos -> VENDE a mercado.                                    |
+//|  O preco anda 200 contra a fita; o robo entra do lado da fita     |
+//|  esperando a correcao. Uma entrada por perna de cada Kagi.        |
 //|                                                                   |
 //|  6 Kagi do mesmo ativo, cada um com um tamanho de reversao        |
 //|  (K1..K6). Liga/desliga cada um em UsarK1..UsarK6.                |
@@ -16,10 +18,12 @@
 //|   - Quantidade: campo "Quantidade por Ordem" da automacao.        |
 //|   - Requer Profit Ultra ou Automacao 2.0 (Asset com periodo Kagi  |
 //|     e indicadores de agressao TR).                                |
-//|   - Confira se o Kagi de K3 (200) bate com um grafico Kagi 200    |
-//|     aberto no Profit. Se nao bater, ajuste o tamanho.             |
+//|   - K1..K6 = reversao de cada Kagi. Confira se K3 (200) bate com  |
+//|     um grafico Kagi 200 aberto no Profit.                         |
 //|                                                                   |
 //|  v1.00 - primeira versao                                          |
+//|  v1.01 - gatilho pelo tamanho da perna do Kagi (maxima - minima)  |
+//|          e fita pelo saldo ACUMULADO de agressao do dia.          |
 //+------------------------------------------------------------------+
 input
   // --- 6 Kagi (ativo, bolsa, periodo Kagi, tamanho da reversao) ---
@@ -35,13 +39,12 @@ input
   UsarK4(true);
   UsarK5(true);
   UsarK6(true);
-  KagiMin(1);          // Kagi contra a fita (minimo) para entrar
+  PernaPts(200);       // Perna do Kagi contra a fita (maxima - minima, pontos)
 
-  // --- Fita ---
-  FonteFita(2);        // 1 = PowerMeter (janela em minutos) | 2 = Volume de agressao TR (barras)
-  JanelaMin(5);        // FonteFita 1: minutos da fita
-  JanelaBarras(5);     // FonteFita 2: barras somadas
-  FatorFita(1.2);      // Lado da fita precisa ser X vezes maior que o outro
+  // --- Fita (acumulado do dia) ---
+  FonteFita(1);        // 1 = Saldo acumulado de agressao TR | 2 = PowerMeter do dia
+  SaldoMin(0);         // FonteFita 1: saldo minimo (contratos) para valer compra/venda
+  FatorFita(1.2);      // FonteFita 2: lado precisa ser X vezes maior que o outro
 
   // --- Ordem ---
   StopPts(120);        // Stop (pontos)
@@ -55,115 +58,74 @@ input
   HoraZerar(1750);
 
 var
-  d1, d2, d3, d4, d5, d6         : Integer;  // direcao de cada Kagi: 1 sobe, -1 cai
-  nSobe, nCai                    : Integer;
-  nViraSobe, nViraCai            : Integer;
-  vC, vV                         : Float;    // agressao da barra (FonteFita 2)
-  agrC, agrV                     : Float;    // agressao somada da janela
-  i                              : Integer;
+  p1, p2, p3, p4, p5, p6         : Float;    // perna de cada Kagi: + alta, - queda (pontos)
+  nAlta, nQueda                  : Integer;  // Kagi cuja perna acabou de chegar a PernaPts
+  saldo, agrC, agrV              : Float;
   fitaCompra, fitaVenda          : Boolean;
   sinalCompra, sinalVenda        : Boolean;
   horarioOk                      : Boolean;
 
 begin
   //================================================================
-  //  DIRECAO DOS KAGI
-  //  Linha do Kagi subindo: fechamento > abertura. Sem mudanca,
-  //  mantem a direcao da barra anterior.
+  //  PERNA DE CADA KAGI
+  //  Tamanho da linha atual do Kagi (maxima - minima), com sinal:
+  //  positivo se a linha sobe, negativo se cai. Kagi desligado = 0.
   //================================================================
-  if not UsarK1 then d1 := 0
-  else if K1.Close > K1.Open then d1 := 1
-  else if K1.Close < K1.Open then d1 := -1
-  else d1 := d1[1];
+  p1 := 0; p2 := 0; p3 := 0; p4 := 0; p5 := 0; p6 := 0;
 
-  if not UsarK2 then d2 := 0
-  else if K2.Close > K2.Open then d2 := 1
-  else if K2.Close < K2.Open then d2 := -1
-  else d2 := d2[1];
+  if UsarK1 then
+    if K1.Close >= K1.Open then p1 := K1.High - K1.Low else p1 := K1.Low - K1.High;
+  if UsarK2 then
+    if K2.Close >= K2.Open then p2 := K2.High - K2.Low else p2 := K2.Low - K2.High;
+  if UsarK3 then
+    if K3.Close >= K3.Open then p3 := K3.High - K3.Low else p3 := K3.Low - K3.High;
+  if UsarK4 then
+    if K4.Close >= K4.Open then p4 := K4.High - K4.Low else p4 := K4.Low - K4.High;
+  if UsarK5 then
+    if K5.Close >= K5.Open then p5 := K5.High - K5.Low else p5 := K5.Low - K5.High;
+  if UsarK6 then
+    if K6.Close >= K6.Open then p6 := K6.High - K6.Low else p6 := K6.Low - K6.High;
 
-  if not UsarK3 then d3 := 0
-  else if K3.Close > K3.Open then d3 := 1
-  else if K3.Close < K3.Open then d3 := -1
-  else d3 := d3[1];
+  // Gatilho so na barra em que a perna CHEGA a PernaPts (uma vez por perna)
+  nAlta := 0;
+  nQueda := 0;
 
-  if not UsarK4 then d4 := 0
-  else if K4.Close > K4.Open then d4 := 1
-  else if K4.Close < K4.Open then d4 := -1
-  else d4 := d4[1];
+  if (p1 >= PernaPts) and (p1[1] < PernaPts) then nAlta := nAlta + 1;
+  if (p2 >= PernaPts) and (p2[1] < PernaPts) then nAlta := nAlta + 1;
+  if (p3 >= PernaPts) and (p3[1] < PernaPts) then nAlta := nAlta + 1;
+  if (p4 >= PernaPts) and (p4[1] < PernaPts) then nAlta := nAlta + 1;
+  if (p5 >= PernaPts) and (p5[1] < PernaPts) then nAlta := nAlta + 1;
+  if (p6 >= PernaPts) and (p6[1] < PernaPts) then nAlta := nAlta + 1;
 
-  if not UsarK5 then d5 := 0
-  else if K5.Close > K5.Open then d5 := 1
-  else if K5.Close < K5.Open then d5 := -1
-  else d5 := d5[1];
-
-  if not UsarK6 then d6 := 0
-  else if K6.Close > K6.Open then d6 := 1
-  else if K6.Close < K6.Open then d6 := -1
-  else d6 := d6[1];
-
-  // Quantos estao subindo / caindo e quantos viraram nesta barra
-  nSobe := 0;
-  nCai := 0;
-  nViraSobe := 0;
-  nViraCai := 0;
-
-  if d1 = 1 then nSobe := nSobe + 1;
-  if d2 = 1 then nSobe := nSobe + 1;
-  if d3 = 1 then nSobe := nSobe + 1;
-  if d4 = 1 then nSobe := nSobe + 1;
-  if d5 = 1 then nSobe := nSobe + 1;
-  if d6 = 1 then nSobe := nSobe + 1;
-
-  if d1 = -1 then nCai := nCai + 1;
-  if d2 = -1 then nCai := nCai + 1;
-  if d3 = -1 then nCai := nCai + 1;
-  if d4 = -1 then nCai := nCai + 1;
-  if d5 = -1 then nCai := nCai + 1;
-  if d6 = -1 then nCai := nCai + 1;
-
-  if (d1 = 1) and (d1[1] = -1) then nViraSobe := nViraSobe + 1;
-  if (d2 = 1) and (d2[1] = -1) then nViraSobe := nViraSobe + 1;
-  if (d3 = 1) and (d3[1] = -1) then nViraSobe := nViraSobe + 1;
-  if (d4 = 1) and (d4[1] = -1) then nViraSobe := nViraSobe + 1;
-  if (d5 = 1) and (d5[1] = -1) then nViraSobe := nViraSobe + 1;
-  if (d6 = 1) and (d6[1] = -1) then nViraSobe := nViraSobe + 1;
-
-  if (d1 = -1) and (d1[1] = 1) then nViraCai := nViraCai + 1;
-  if (d2 = -1) and (d2[1] = 1) then nViraCai := nViraCai + 1;
-  if (d3 = -1) and (d3[1] = 1) then nViraCai := nViraCai + 1;
-  if (d4 = -1) and (d4[1] = 1) then nViraCai := nViraCai + 1;
-  if (d5 = -1) and (d5[1] = 1) then nViraCai := nViraCai + 1;
-  if (d6 = -1) and (d6[1] = 1) then nViraCai := nViraCai + 1;
+  if (p1 <= -PernaPts) and (p1[1] > -PernaPts) then nQueda := nQueda + 1;
+  if (p2 <= -PernaPts) and (p2[1] > -PernaPts) then nQueda := nQueda + 1;
+  if (p3 <= -PernaPts) and (p3[1] > -PernaPts) then nQueda := nQueda + 1;
+  if (p4 <= -PernaPts) and (p4[1] > -PernaPts) then nQueda := nQueda + 1;
+  if (p5 <= -PernaPts) and (p5[1] > -PernaPts) then nQueda := nQueda + 1;
+  if (p6 <= -PernaPts) and (p6[1] > -PernaPts) then nQueda := nQueda + 1;
 
   //================================================================
-  //  FITA: quem esta agredindo mais
+  //  FITA: acumulado do dia
   //================================================================
-  agrC := 0;
-  agrV := 0;
   if FonteFita = 1 then
   begin
-    agrC := PowerMeter(osBuy, JanelaMin);
-    agrV := PowerMeter(osSell, JanelaMin);
+    saldo := AccAgressSaldo(1);   // saldo acumulado em contratos
+    fitaCompra := saldo > SaldoMin;
+    fitaVenda  := saldo < -SaldoMin;
   end
   else
   begin
-    vC := AgressionVolBuy;
-    vV := AgressionVolSell;
-    for i := 0 to JanelaBarras - 1 do
-    begin
-      agrC := agrC + vC[i];
-      agrV := agrV + vV[i];
-    end;
+    agrC := PowerMeter(osBuy);
+    agrV := PowerMeter(osSell);
+    fitaCompra := (agrC > 0) and (agrC >= agrV * FatorFita);
+    fitaVenda  := (agrV > 0) and (agrV >= agrC * FatorFita);
   end;
-
-  fitaCompra := (agrC > 0) and (agrC >= agrV * FatorFita);
-  fitaVenda  := (agrV > 0) and (agrV >= agrC * FatorFita);
 
   //================================================================
   //  SINAIS (correcao contra o Kagi, a favor da fita)
   //================================================================
-  sinalVenda  := fitaVenda  and (nViraSobe >= 1) and (nSobe >= KagiMin);
-  sinalCompra := fitaCompra and (nViraCai  >= 1) and (nCai  >= KagiMin);
+  sinalCompra := fitaCompra and (nQueda >= 1);   // caiu 200 com fita compradora
+  sinalVenda  := fitaVenda  and (nAlta  >= 1);   // subiu 200 com fita vendedora
 
   horarioOk := (Time >= HoraInicio) and (Time < HoraFimEntradas);
 
