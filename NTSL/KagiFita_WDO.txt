@@ -1,0 +1,133 @@
+//+------------------------------------------------------------------+
+//|  KagiFita_WDO  -  Estrategia de execucao NTSL (Profit)            |
+//|                                                                   |
+//|  CORRECAO A FAVOR DA FITA, pelo CANDLE do proprio grafico         |
+//|   - VENDA : candle de ALTA (fechamento > abertura) com amplitude  |
+//|             (maxima - minima) >= Amplitude e fita VENDEDORA.      |
+//|   - COMPRA: candle de BAIXA (fechamento < abertura) com amplitude |
+//|             >= Amplitude e fita COMPRADORA.                       |
+//|  Candle pequeno ou na mesma direcao da fita: nao entra.           |
+//|                                                                   |
+//|  COMO USAR                                                        |
+//|   - Coloque a estrategia no grafico Kagi do WDO (o candle e a     |
+//|     linha do Kagi). Funciona tambem em grafico de tempo.          |
+//|   - Automacao: "Realizar envio de ordens no fechamento do candle" |
+//|     (avalia o candle ja fechado).                                 |
+//|   - Quantidade: campo "Quantidade por Ordem" da automacao.        |
+//|   - Para os 6 Kagi: uma automacao por grafico Kagi, cada uma com  |
+//|     o seu tamanho. Em conta netting elas dividem a mesma posicao. |
+//|                                                                   |
+//|  v1.00 - primeira versao                                          |
+//|  v1.01 - gatilho pela perna do Kagi e fita acumulada              |
+//|  v1.02 - acumulado igual ao do MQL5 (variacao em 10 minutos)      |
+//|  v1.03 - gatilho pelo candle do grafico: cor contra a fita e      |
+//|          amplitude minima. Sai a leitura de Kagi via Asset, que   |
+//|          abria posicao sem o candle confirmar. Fita pela variacao |
+//|          do saldo de agressao nos ultimos AcumJanela minutos      |
+//|          (PowerMeter), valendo em qualquer tipo de grafico.       |
+//|  v1.04 - versao dolar (WDO/DOL): parametros ajustados ao ativo.   |
+//|          Tick 0,5 ponto. Para DOL (cheio) use AcumMinimo menor,   |
+//|          pois o volume e bem menor que o do WDO.                  |
+//+------------------------------------------------------------------+
+input
+  // --- Candle ---
+  Amplitude(12);       // Maxima - minima minima do candle (pontos; 10 a 15)
+
+  // --- Fita: acumulado (igual ao Consenso_WIN do MQL5) ---
+  UsarFita(true);      // false = entra so pelo candle
+  AcumJanela(10);      // Saldo de agressao dos ultimos X minutos (MQL5: 600 seg)
+  AcumMinimo(500);     // Saldo minimo em contratos para valer compra/venda
+
+  // --- Ordem ---
+  StopPts(7);          // Stop (pontos)
+  AlvoPts(4.5);        // Alvo (pontos)
+  SlipStop(1);         // Limite da ordem stop alem do gatilho (pontos)
+  Reverter(true);      // Sinal contrario com posicao aberta: vira a mao
+
+  // --- Horario (HHMM) ---
+  HoraInicio(905);
+  HoraFimEntradas(1715);
+  HoraZerar(1750);
+
+var
+  amp                            : Float;    // maxima - minima do candle
+  candleAlta, candleBaixa        : Boolean;
+  variacao                       : Float;    // saldo de agressao na janela
+  fitaCompra, fitaVenda          : Boolean;
+  sinalCompra, sinalVenda        : Boolean;
+  horarioOk                      : Boolean;
+
+begin
+  //================================================================
+  //  CANDLE: cor e amplitude
+  //================================================================
+  amp := High - Low;
+  candleAlta  := (Close > Open) and (amp >= Amplitude);
+  candleBaixa := (Close < Open) and (amp >= Amplitude);
+
+  //================================================================
+  //  FITA: acumulado (mesma regra do Consenso_WIN no MQL5)
+  //  Saldo = contratos agredidos na compra - na venda nos ultimos
+  //  AcumJanela minutos (= variacao do delta acumulado na janela).
+  //    +AcumMinimo ou mais -> compradora | -AcumMinimo ou menos -> vendedora
+  //================================================================
+  variacao := PowerMeter(osBuy, AcumJanela) - PowerMeter(osSell, AcumJanela);
+
+  if UsarFita then
+  begin
+    fitaCompra := variacao >= AcumMinimo;
+    fitaVenda  := variacao <= -AcumMinimo;
+  end
+  else
+  begin
+    fitaCompra := true;
+    fitaVenda  := true;
+  end;
+
+  //================================================================
+  //  SINAIS (candle contra a fita)
+  //================================================================
+  sinalVenda  := candleAlta  and fitaVenda;    // subiu forte, fita vende
+  sinalCompra := candleBaixa and fitaCompra;   // caiu forte, fita compra
+
+  horarioOk := (Time >= HoraInicio) and (Time < HoraFimEntradas);
+
+  if sinalVenda then PaintBar(clRed)
+  else if sinalCompra then PaintBar(clLime);
+
+  //================================================================
+  //  ORDENS
+  //================================================================
+  if HasPosition and (Time >= HoraZerar) then
+    ClosePosition
+  else if not HasPosition then
+  begin
+    if horarioOk then
+    begin
+      if sinalVenda then
+        SellShortAtMarket
+      else if sinalCompra then
+        BuyAtMarket;
+    end;
+  end
+  else if IsBought then
+  begin
+    if Reverter and horarioOk and sinalVenda then
+      ReversePosition
+    else
+    begin
+      SellToCoverLimit(BuyPrice + AlvoPts);
+      SellToCoverStop(BuyPrice - StopPts, BuyPrice - StopPts - SlipStop);
+    end;
+  end
+  else if IsSold then
+  begin
+    if Reverter and horarioOk and sinalCompra then
+      ReversePosition
+    else
+    begin
+      BuyToCoverLimit(SellPrice - AlvoPts);
+      BuyToCoverStop(SellPrice + StopPts, SellPrice + StopPts + SlipStop);
+    end;
+  end;
+end;
