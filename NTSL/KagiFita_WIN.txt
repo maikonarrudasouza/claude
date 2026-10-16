@@ -1,52 +1,39 @@
 //+------------------------------------------------------------------+
 //|  KagiFita_WIN  -  Estrategia de execucao NTSL (Profit)            |
 //|                                                                   |
-//|  CORRECAO A FAVOR DA FITA                                         |
-//|   - Acumulado da fita COMPRADOR e a perna de QUEDA do Kagi        |
-//|     chega a 200 pontos (maxima - minima) -> COMPRA a mercado.     |
-//|   - Acumulado VENDEDOR e a perna de ALTA do Kagi chega a 200      |
-//|     pontos -> VENDE a mercado.                                    |
-//|  O preco anda 200 contra a fita; o robo entra do lado da fita     |
-//|  esperando a correcao. Uma entrada por perna de cada Kagi.        |
-//|                                                                   |
-//|  6 Kagi do mesmo ativo, cada um com um tamanho de reversao        |
-//|  (K1..K6). Liga/desliga cada um em UsarK1..UsarK6.                |
+//|  CORRECAO A FAVOR DA FITA, pelo CANDLE do proprio grafico         |
+//|   - VENDA : candle de ALTA (fechamento > abertura) com amplitude  |
+//|             (maxima - minima) >= Amplitude e fita VENDEDORA.      |
+//|   - COMPRA: candle de BAIXA (fechamento < abertura) com amplitude |
+//|             >= Amplitude e fita COMPRADORA.                       |
+//|  Candle pequeno ou na mesma direcao da fita: nao entra.           |
 //|                                                                   |
 //|  COMO USAR                                                        |
-//|   - Grafico base: WIN em 1 minuto (AcumJanela conta minutos).    |
-//|   - Automacao: "Realizar envio de ordens no fechamento do candle".|
+//|   - Coloque a estrategia no grafico Kagi do WIN (o candle e a     |
+//|     linha do Kagi). Funciona tambem em grafico de tempo.          |
+//|   - Automacao: "Realizar envio de ordens no fechamento do candle" |
+//|     (avalia o candle ja fechado).                                 |
 //|   - Quantidade: campo "Quantidade por Ordem" da automacao.        |
-//|   - Requer Profit Ultra ou Automacao 2.0 (Asset com periodo Kagi  |
-//|     e indicadores de agressao TR).                                |
-//|   - K1..K6 = reversao de cada Kagi. Confira se K3 (200) bate com  |
-//|     um grafico Kagi 200 aberto no Profit.                         |
+//|   - Para os 6 Kagi: uma automacao por grafico Kagi, cada uma com  |
+//|     o seu tamanho. Em conta netting elas dividem a mesma posicao. |
 //|                                                                   |
 //|  v1.00 - primeira versao                                          |
-//|  v1.01 - gatilho pelo tamanho da perna do Kagi (maxima - minima)  |
-//|          e fita pelo saldo ACUMULADO de agressao do dia.          |
-//|  v1.02 - acumulado igual ao do MQL5: delta (agressao compradora - |
-//|          vendedora) acumulado no dia; o lado e a VARIACAO dele    |
-//|          nos ultimos AcumJanela minutos (+500 compra, -500 venda).|
+//|  v1.01 - gatilho pela perna do Kagi e fita acumulada              |
+//|  v1.02 - acumulado igual ao do MQL5 (variacao em 10 minutos)      |
+//|  v1.03 - gatilho pelo candle do grafico: cor contra a fita e      |
+//|          amplitude minima. Sai a leitura de Kagi via Asset, que   |
+//|          abria posicao sem o candle confirmar. Fita pela variacao |
+//|          do saldo de agressao nos ultimos AcumJanela minutos      |
+//|          (PowerMeter), valendo em qualquer tipo de grafico.       |
 //+------------------------------------------------------------------+
 input
-  // --- 6 Kagi (ativo, bolsa, periodo Kagi, tamanho da reversao) ---
-  K1("WINFUT", feedBMF, itKagiChart, 100);
-  K2("WINFUT", feedBMF, itKagiChart, 150);
-  K3("WINFUT", feedBMF, itKagiChart, 200);
-  K4("WINFUT", feedBMF, itKagiChart, 250);
-  K5("WINFUT", feedBMF, itKagiChart, 300);
-  K6("WINFUT", feedBMF, itKagiChart, 400);
-  UsarK1(true);
-  UsarK2(true);
-  UsarK3(true);
-  UsarK4(true);
-  UsarK5(true);
-  UsarK6(true);
-  PernaPts(200);       // Perna do Kagi contra a fita (maxima - minima, pontos)
+  // --- Candle ---
+  Amplitude(200);      // Maxima - minima minima do candle (pontos)
 
   // --- Fita: acumulado (igual ao Consenso_WIN do MQL5) ---
-  AcumJanela(10);      // Variacao do acumulado nos ultimos X minutos (MQL5: 600 seg)
-  AcumMinimo(500);     // Variacao minima em contratos para valer compra/venda
+  UsarFita(true);      // false = entra so pelo candle
+  AcumJanela(10);      // Saldo de agressao dos ultimos X minutos (MQL5: 600 seg)
+  AcumMinimo(500);     // Saldo minimo em contratos para valer compra/venda
 
   // --- Ordem ---
   StopPts(120);        // Stop (pontos)
@@ -60,75 +47,45 @@ input
   HoraZerar(1750);
 
 var
-  p1, p2, p3, p4, p5, p6         : Float;    // perna de cada Kagi: + alta, - queda (pontos)
-  nAlta, nQueda                  : Integer;  // Kagi cuja perna acabou de chegar a PernaPts
-  acum, variacao                 : Float;    // delta acumulado do dia e sua variacao
-  dia                            : Integer;
+  amp                            : Float;    // maxima - minima do candle
+  candleAlta, candleBaixa        : Boolean;
+  variacao                       : Float;    // saldo de agressao na janela
   fitaCompra, fitaVenda          : Boolean;
   sinalCompra, sinalVenda        : Boolean;
   horarioOk                      : Boolean;
 
 begin
   //================================================================
-  //  PERNA DE CADA KAGI
-  //  Tamanho da linha atual do Kagi (maxima - minima), com sinal:
-  //  positivo se a linha sobe, negativo se cai. Kagi desligado = 0.
+  //  CANDLE: cor e amplitude
   //================================================================
-  p1 := 0; p2 := 0; p3 := 0; p4 := 0; p5 := 0; p6 := 0;
-
-  if UsarK1 then
-    if K1.Close >= K1.Open then p1 := K1.High - K1.Low else p1 := K1.Low - K1.High;
-  if UsarK2 then
-    if K2.Close >= K2.Open then p2 := K2.High - K2.Low else p2 := K2.Low - K2.High;
-  if UsarK3 then
-    if K3.Close >= K3.Open then p3 := K3.High - K3.Low else p3 := K3.Low - K3.High;
-  if UsarK4 then
-    if K4.Close >= K4.Open then p4 := K4.High - K4.Low else p4 := K4.Low - K4.High;
-  if UsarK5 then
-    if K5.Close >= K5.Open then p5 := K5.High - K5.Low else p5 := K5.Low - K5.High;
-  if UsarK6 then
-    if K6.Close >= K6.Open then p6 := K6.High - K6.Low else p6 := K6.Low - K6.High;
-
-  // Gatilho so na barra em que a perna CHEGA a PernaPts (uma vez por perna)
-  nAlta := 0;
-  nQueda := 0;
-
-  if (p1 >= PernaPts) and (p1[1] < PernaPts) then nAlta := nAlta + 1;
-  if (p2 >= PernaPts) and (p2[1] < PernaPts) then nAlta := nAlta + 1;
-  if (p3 >= PernaPts) and (p3[1] < PernaPts) then nAlta := nAlta + 1;
-  if (p4 >= PernaPts) and (p4[1] < PernaPts) then nAlta := nAlta + 1;
-  if (p5 >= PernaPts) and (p5[1] < PernaPts) then nAlta := nAlta + 1;
-  if (p6 >= PernaPts) and (p6[1] < PernaPts) then nAlta := nAlta + 1;
-
-  if (p1 <= -PernaPts) and (p1[1] > -PernaPts) then nQueda := nQueda + 1;
-  if (p2 <= -PernaPts) and (p2[1] > -PernaPts) then nQueda := nQueda + 1;
-  if (p3 <= -PernaPts) and (p3[1] > -PernaPts) then nQueda := nQueda + 1;
-  if (p4 <= -PernaPts) and (p4[1] > -PernaPts) then nQueda := nQueda + 1;
-  if (p5 <= -PernaPts) and (p5[1] > -PernaPts) then nQueda := nQueda + 1;
-  if (p6 <= -PernaPts) and (p6[1] > -PernaPts) then nQueda := nQueda + 1;
+  amp := High - Low;
+  candleAlta  := (Close > Open) and (amp >= Amplitude);
+  candleBaixa := (Close < Open) and (amp >= Amplitude);
 
   //================================================================
   //  FITA: acumulado (mesma regra do Consenso_WIN no MQL5)
-  //  acum = agressao compradora - vendedora acumulada no dia (contratos)
-  //  Lado = variacao do acum nos ultimos AcumJanela minutos:
-  //    subiu AcumMinimo ou mais  -> compra
-  //    caiu  AcumMinimo ou mais  -> venda
-  //  No comeco do dia, antes de completar a janela, fica neutro.
+  //  Saldo = contratos agredidos na compra - na venda nos ultimos
+  //  AcumJanela minutos (= variacao do delta acumulado na janela).
+  //    +AcumMinimo ou mais -> compradora | -AcumMinimo ou menos -> vendedora
   //================================================================
-  acum := AccAgressSaldo(1);
-  dia := Date;
-  variacao := 0;
-  if dia[AcumJanela] = dia then
-    variacao := acum - acum[AcumJanela];
+  variacao := PowerMeter(osBuy, AcumJanela) - PowerMeter(osSell, AcumJanela);
 
-  fitaCompra := variacao >= AcumMinimo;
-  fitaVenda  := variacao <= -AcumMinimo;
+  if UsarFita then
+  begin
+    fitaCompra := variacao >= AcumMinimo;
+    fitaVenda  := variacao <= -AcumMinimo;
+  end
+  else
+  begin
+    fitaCompra := true;
+    fitaVenda  := true;
+  end;
 
   //================================================================
-  //  SINAIS (correcao contra o Kagi, a favor da fita)
+  //  SINAIS (candle contra a fita)
   //================================================================
-  sinalCompra := fitaCompra and (nQueda >= 1);   // caiu 200 com fita compradora
-  sinalVenda  := fitaVenda  and (nAlta  >= 1);   // subiu 200 com fita vendedora
+  sinalVenda  := candleAlta  and fitaVenda;    // subiu forte, fita vende
+  sinalCompra := candleBaixa and fitaCompra;   // caiu forte, fita compra
 
   horarioOk := (Time >= HoraInicio) and (Time < HoraFimEntradas);
 
