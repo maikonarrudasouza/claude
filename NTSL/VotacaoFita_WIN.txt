@@ -30,11 +30,17 @@
 //|   Depois do cancelamento, aquele lado fica bloqueado por          |
 //|   BloqueioBarras candles.                                         |
 //|                                                                   |
-//|  SAIDA                                                            |
-//|   - Alvo e stop (ToCover, enviados em OCO pela automacao).        |
-//|   - Reverter = true: votos fortes do lado contrario zeram a       |
-//|     posicao; a nova limite sai nos ticks seguintes.               |
-//|   - Zera no horario HoraZerar.                                    |
+//|  POSICAO E SAIDA (GerenciarPosicao)                               |
+//|   false (padrao) - o codigo NAO consulta posicao. Ele so cuida da |
+//|     ordem de entrada e do cancelamento pela fita. Para conviver   |
+//|     com outros robos, configure na automacao:                     |
+//|       * Opcoes de saida: OCO com alvo e stop;                     |
+//|       * Zeragem automatica por horario;                           |
+//|       * "Quantidade maxima da posicao" = "Quantidade por Ordem"   |
+//|         (impede que a mesma limite seja reenviada e aumente a     |
+//|         posicao depois de executada).                             |
+//|   true - o codigo le a posicao da automacao (HasPosition) e       |
+//|     envia alvo/stop (ToCover), reversao e zeragem em HoraZerar.   |
 //|                                                                   |
 //|  COMO USAR (TICK A TICK)                                          |
 //|   - Automacao: "Realizar envio de ordens quando a condicao for    |
@@ -49,6 +55,8 @@
 //|   - Pontos em pontos do WIN (tick 5). Para WDO ajuste distancias. |
 //|                                                                   |
 //|  v1.00 - primeira versao                                          |
+//|  v1.01 - GerenciarPosicao: por padrao o codigo nao consulta a     |
+//|          posicao; saida pela OCO da automacao (outros robos)      |
 //+------------------------------------------------------------------+
 input
   // --- Votacao ---
@@ -87,7 +95,9 @@ input
   BloqueioBarras(1);    // Candles sem nova entrada no lado cancelado
 
   // --- Saida ---
-  StopPts(120);
+  GerenciarPosicao(false); // false = sem ler posicao; saida pela OCO da automacao
+  StopPts(120);         // StopPts, AlvoPts, SlipStop, Reverter e HoraZerar
+                        // so valem com GerenciarPosicao = true
   AlvoPts(75);
   SlipStop(20);         // Limite da ordem stop alem do gatilho
   Reverter(true);
@@ -206,7 +216,7 @@ begin
   //================================================================
   //  ORDENS
   //================================================================
-  if HasPosition then
+  if GerenciarPosicao and HasPosition then
   begin
     ladoPendente := 0;
 
