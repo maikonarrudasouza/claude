@@ -1,0 +1,314 @@
+//+------------------------------------------------------------------+
+//|  VotacaoFita_WIN  -  Estrategia de execucao NTSL (Profit)         |
+//|                                                                   |
+//|  VOTACAO DE INDICADORES + ORDEM LIMITE + CANCELAMENTO PELA FITA   |
+//|                                                                   |
+//|  Cada indicador ligado vota +1 (compra), -1 (venda) ou 0:         |
+//|   1 - Medias   : MME rapida acima/abaixo da MME lenta             |
+//|   2 - IFR      : acima de IfrCompra / abaixo de IfrVenda          |
+//|   3 - MACD     : histograma acima/abaixo de zero                  |
+//|   4 - HiLo     : fechamento acima/abaixo do HiLo Activator        |
+//|   5 - VWAP     : fechamento acima/abaixo da VWAP diaria           |
+//|   6 - DI+/DI-  : DI+ > DI- (ou o contrario) com ADX >= AdxMinimo  |
+//|   7 - Fita     : saldo de agressao dos ultimos AcumJanela minutos |
+//|                                                                   |
+//|  ENTRADA                                                          |
+//|   - VotosMin ou mais a favor e no maximo VotosContraMax contra.   |
+//|   - Ordem LIMITE a Distancia pontos do preco do sinal (compra     |
+//|     abaixo, venda acima; Distancia 0 = no preco). O preco fica    |
+//|     fixo enquanto a ordem vale, nao persegue o mercado.           |
+//|   - A ordem vale ValidadeBarras candles. Se os votos deixarem de   |
+//|     sustentar o lado, ela tambem e retirada.                      |
+//|                                                                   |
+//|  CANCELAMENTO PELA FITA (agressao forte contra a ordem)           |
+//|   Com a limite apregoada e sem posicao, a ordem e cancelada se:   |
+//|   a) desde que a ordem foi enviada, o saldo de agressao andou     |
+//|      CancelSaldo contratos CONTRA ela (compra: vendedores         |
+//|      agredindo; venda: compradores agredindo), ou                 |
+//|   b) o saldo do ultimo CancelJanela minuto(s) passou de           |
+//|      CancelJanelaMin contratos contra a ordem.                    |
+//|   Depois do cancelamento, aquele lado fica bloqueado por          |
+//|   BloqueioBarras candles.                                         |
+//|                                                                   |
+//|  SAIDA                                                            |
+//|   - Alvo e stop (ToCover, enviados em OCO pela automacao).        |
+//|   - Reverter = true: votos fortes do lado contrario zeram a       |
+//|     posicao; a nova limite sai nos ticks seguintes.               |
+//|   - Zera no horario HoraZerar.                                    |
+//|                                                                   |
+//|  COMO USAR (TICK A TICK)                                          |
+//|   - Automacao: "Realizar envio de ordens quando a condicao for    |
+//|     satisfeita" + "Permitir multiplos envios e alteracoes de      |
+//|     ordens para a mesma barra". Assim o codigo roda a cada        |
+//|     negocio. A plataforma limita alteracoes a 1 a cada 10 s.      |
+//|   - Esse modo nao tem backtest fiel: teste no Replay ou em conta  |
+//|     de simulacao. O PowerMeter le a fita ao vivo, entao no        |
+//|     historico os votos e o cancelamento pela fita nao refletem o  |
+//|     que aconteceu.                                                |
+//|   - Quantidade: campo "Quantidade por Ordem" da automacao.        |
+//|   - Pontos em pontos do WIN (tick 5). Para WDO ajuste distancias. |
+//|                                                                   |
+//|  v1.00 - primeira versao                                          |
+//+------------------------------------------------------------------+
+input
+  // --- Votacao ---
+  VotosMin(4);          // Votos a favor para entrar
+  VotosContraMax(1);    // Votos contra tolerados
+  UsarMedias(true);
+  MediaRapida(9);
+  MediaLenta(21);
+  UsarIFR(true);
+  IfrPeriodo(14);
+  IfrCompra(55);
+  IfrVenda(45);
+  UsarMACD(true);
+  MacdLonga(26);
+  MacdCurta(12);
+  MacdSinal(9);
+  UsarHiLo(true);
+  HiLoPeriodo(10);
+  UsarVWAP(true);
+  UsarDI(true);
+  DiPeriodo(14);
+  AdxMinimo(20);
+  UsarFita(true);
+  AcumJanela(10);       // Saldo de agressao dos ultimos X minutos
+  AcumMinimo(500);      // Saldo minimo (contratos) para a fita votar
+
+  // --- Ordem limite ---
+  Distancia(0);         // Pontos do preco do sinal (0 = no preco)
+  ValidadeBarras(3);    // Candles que a limite fica apregoada
+
+  // --- Cancelamento pela fita ---
+  UsarCancelamento(true);
+  CancelSaldo(300);     // Agressao contra desde o envio (contratos)
+  CancelJanela(1);      // Janela curta (minutos)
+  CancelJanelaMin(400); // Agressao contra na janela curta (contratos)
+  BloqueioBarras(1);    // Candles sem nova entrada no lado cancelado
+
+  // --- Saida ---
+  StopPts(120);
+  AlvoPts(75);
+  SlipStop(20);         // Limite da ordem stop alem do gatilho
+  Reverter(true);
+
+  // --- Horario (HHMM) ---
+  HoraInicio(915);
+  HoraFimEntradas(1715);
+  HoraZerar(1750);
+
+var
+  // votos
+  votosCompra, votosVenda        : Integer;
+  diMais, diMenos                : Float;
+  saldoJanela                    : Float;
+  sinalCompra, sinalVenda        : Boolean;
+  horarioOk                      : Boolean;
+
+  // fita
+  saldoDia, saldoCurto           : Float;
+  contraEnvio, contraCurto       : Float;
+  agressaoForte                  : Boolean;
+
+  // estado da ordem limite (sem [n]: mantem o valor entre ticks)
+  ladoPendente                   : Integer;  // 1 compra, -1 venda, 0 nenhuma
+  precoLimite                    : Float;
+  barraEnvio                     : Integer;
+  saldoEnvio                     : Float;
+  ladoBloqueado                  : Integer;
+  barraBloqueio                  : Integer;
+  cancelarAgora                  : Boolean;
+
+begin
+  //================================================================
+  //  VOTACAO
+  //================================================================
+  votosCompra := 0;
+  votosVenda  := 0;
+
+  if UsarMedias then
+  begin
+    if MediaExp(MediaRapida, Close) > MediaExp(MediaLenta, Close) then
+      votosCompra := votosCompra + 1
+    else if MediaExp(MediaRapida, Close) < MediaExp(MediaLenta, Close) then
+      votosVenda := votosVenda + 1;
+  end;
+
+  if UsarIFR then
+  begin
+    if RSI(IfrPeriodo, 0) >= IfrCompra then
+      votosCompra := votosCompra + 1
+    else if RSI(IfrPeriodo, 0) <= IfrVenda then
+      votosVenda := votosVenda + 1;
+  end;
+
+  if UsarMACD then
+  begin
+    if MACD(MacdLonga, MacdCurta, MacdSinal)|1| > 0 then
+      votosCompra := votosCompra + 1
+    else if MACD(MacdLonga, MacdCurta, MacdSinal)|1| < 0 then
+      votosVenda := votosVenda + 1;
+  end;
+
+  if UsarHiLo then
+  begin
+    if Close > HiloActivator(HiLoPeriodo) then
+      votosCompra := votosCompra + 1
+    else if Close < HiloActivator(HiLoPeriodo) then
+      votosVenda := votosVenda + 1;
+  end;
+
+  if UsarVWAP then
+  begin
+    if Close > VWAP(1) then
+      votosCompra := votosCompra + 1
+    else if Close < VWAP(1) then
+      votosVenda := votosVenda + 1;
+  end;
+
+  if UsarDI then
+  begin
+    diMais  := DiPDiM(DiPeriodo)|0|;
+    diMenos := DiPDiM(DiPeriodo)|1|;
+    if ADX(DiPeriodo, DiPeriodo) >= AdxMinimo then
+    begin
+      if diMais > diMenos then
+        votosCompra := votosCompra + 1
+      else if diMenos > diMais then
+        votosVenda := votosVenda + 1;
+    end;
+  end;
+
+  if UsarFita then
+  begin
+    saldoJanela := PowerMeter(osBuy, AcumJanela) - PowerMeter(osSell, AcumJanela);
+    if saldoJanela >= AcumMinimo then
+      votosCompra := votosCompra + 1
+    else if saldoJanela <= -AcumMinimo then
+      votosVenda := votosVenda + 1;
+  end;
+
+  sinalCompra := (votosCompra >= VotosMin) and (votosVenda <= VotosContraMax);
+  sinalVenda  := (votosVenda >= VotosMin) and (votosCompra <= VotosContraMax);
+
+  horarioOk := (Time >= HoraInicio) and (Time < HoraFimEntradas);
+
+  if sinalCompra then PaintBar(clLime)
+  else if sinalVenda then PaintBar(clRed);
+
+  //================================================================
+  //  FITA PARA O CANCELAMENTO
+  //  saldo do dia = agressao compradora - vendedora (contratos)
+  //================================================================
+  saldoDia   := PowerMeter(osBuy) - PowerMeter(osSell);
+  saldoCurto := PowerMeter(osBuy, CancelJanela) - PowerMeter(osSell, CancelJanela);
+
+  //================================================================
+  //  ORDENS
+  //================================================================
+  if HasPosition then
+  begin
+    ladoPendente := 0;
+
+    if Time >= HoraZerar then
+      ClosePosition
+    else if IsBought then
+    begin
+      if Reverter and horarioOk and sinalVenda then
+        ClosePosition
+      else
+      begin
+        SellToCoverLimit(BuyPrice + AlvoPts);
+        SellToCoverStop(BuyPrice - StopPts, BuyPrice - StopPts - SlipStop);
+      end;
+    end
+    else if IsSold then
+    begin
+      if Reverter and horarioOk and sinalCompra then
+        ClosePosition
+      else
+      begin
+        BuyToCoverLimit(SellPrice - AlvoPts);
+        BuyToCoverStop(SellPrice + StopPts, SellPrice + StopPts + SlipStop);
+      end;
+    end;
+  end
+  else
+  begin
+    // libera o bloqueio depois de BloqueioBarras candles
+    if (ladoBloqueado <> 0) and (CurrentBar - barraBloqueio >= BloqueioBarras) then
+      ladoBloqueado := 0;
+
+    //--------------------------------------------------------------
+    //  Ordem ja apregoada: cancela, expira ou mantem
+    //--------------------------------------------------------------
+    cancelarAgora := false;
+
+    if ladoPendente <> 0 then
+    begin
+      // agressao contra a ordem (positivo = contra)
+      contraEnvio := (saldoDia - saldoEnvio) * (-ladoPendente);
+      contraCurto := saldoCurto * (-ladoPendente);
+      agressaoForte := UsarCancelamento and
+                       ((contraEnvio >= CancelSaldo) or (contraCurto >= CancelJanelaMin));
+
+      if agressaoForte then
+      begin
+        ConsoleLog("Fita forte contra a limite em " + FloatToString(precoLimite, 0) +
+                   ": desde o envio " + FloatToString(contraEnvio, 0) +
+                   ", ultimo(s) " + CancelJanela + " min " + FloatToString(contraCurto, 0) +
+                   ". Cancelando.", clYellow);
+        ladoBloqueado := ladoPendente;
+        barraBloqueio := CurrentBar;
+        cancelarAgora := true;
+      end
+      else if (CurrentBar - barraEnvio >= ValidadeBarras) or (not horarioOk) or
+              ((ladoPendente = 1) and (votosCompra < VotosMin)) or
+              ((ladoPendente = -1) and (votosVenda < VotosMin)) then
+        cancelarAgora := true;
+    end;
+
+    if cancelarAgora then
+    begin
+      ladoPendente := 0;
+      CancelPendingOrders;
+    end
+    else
+    begin
+      //------------------------------------------------------------
+      //  Novo sinal: fixa preco, candle e saldo de referencia
+      //------------------------------------------------------------
+      if (ladoPendente = 0) and horarioOk then
+      begin
+        if sinalCompra and (ladoBloqueado <> 1) then
+        begin
+          ladoPendente := 1;
+          precoLimite  := Round((Close - Distancia) / MinPriceIncrement) * MinPriceIncrement;
+          barraEnvio   := CurrentBar;
+          saldoEnvio   := saldoDia;
+        end
+        else if sinalVenda and (ladoBloqueado <> -1) then
+        begin
+          ladoPendente := -1;
+          precoLimite  := Round((Close + Distancia) / MinPriceIncrement) * MinPriceIncrement;
+          barraEnvio   := CurrentBar;
+          saldoEnvio   := saldoDia;
+        end;
+      end;
+
+      // reenvia a cada tick para a automacao manter a ordem
+      if ladoPendente = 1 then
+        BuyLimit(precoLimite)
+      else if ladoPendente = -1 then
+        SellShortLimit(precoLimite);
+    end;
+  end;
+
+  //================================================================
+  //  RAIO-X (Automacoes Premium): placar e fita ao vivo
+  //================================================================
+  XRay("Votos compra", sinalCompra, "Votacao", votosCompra, clLime, clGray);
+  XRay("Votos venda", sinalVenda, "Votacao", votosVenda, clRed, clGray);
+  XRay("Limite apregoada", ladoPendente <> 0, "Ordem", precoLimite, clYellow, clGray);
+  XRay("Saldo fita curto", saldoCurto >= 0, "Fita", saldoCurto, clLime, clRed);
+end;
